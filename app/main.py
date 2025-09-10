@@ -28,7 +28,7 @@ class ClaudePrompt(BaseModel):
 @app.post("/chat")
 def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     if session is None:
-        sandbox = Sandbox(
+        sandbox = Sandbox.create(
             template=sandbox_template,
             timeout=sandbox_timeout,
             envs={
@@ -42,7 +42,7 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
                 f"git clone {prompt.repo} && cd {prompt.repo.split('/')[-1]}"
             )
     else:
-        sandbox = Sandbox(sandbox_id=session_sandbox_map[session])
+        sandbox = Sandbox.connect(sandbox_id=session_sandbox_map[session])
 
     cmd = "claude"
     claude_args = [

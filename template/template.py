@@ -1,4 +1,4 @@
-from e2b_template import Template
+from e2b import Template
 
 template = (
     Template()
