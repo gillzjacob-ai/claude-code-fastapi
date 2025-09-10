@@ -29,6 +29,7 @@ def prompt(session: ClaudeSession):
             timeout=sandbox_timeout,
             envs={
                 "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
+                "CONTEXT7_API_KEY": os.getenv("CONTEXT7_API_KEY", ""),
                 "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
             },
         )
@@ -47,6 +48,8 @@ def prompt(session: ClaudeSession):
         "json",
         "--mcp-config",
         "/.mcp/mcp.json",
+        "--append-system-prompt",
+        "GitHub PAT is already set in the environment GITHUB_PAT",
     ]
     if session.resume:
         claude_args.append(f"--resume")

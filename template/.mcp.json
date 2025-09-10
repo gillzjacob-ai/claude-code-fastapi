@@ -1,10 +1,10 @@
 {
     "mcpServers": {
-      "github": {
+      "context7": {
         "type": "http",
-        "url": "https://api.githubcopilot.com/mcp/",
+        "url": "https://mcp.context7.com/mcp",
         "headers": {
-          "Authorization": "Bearer ${GITHUB_PAT}"
+          "Authorization": "Bearer ${CONTEXT7_API_KEY}"
         }
       }
     }
