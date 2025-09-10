@@ -27,7 +27,10 @@ def prompt(session: ClaudeSession):
         sandbox = Sandbox(
             template=sandbox_template,
             timeout=sandbox_timeout,
-            envs={"GITHUB_PAT": os.getenv("GITHUB_PAT", "")},
+            envs={
+                "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
+                "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
+            },
         )
         if session.repo:
             sandbox.commands.run(
@@ -51,7 +54,6 @@ def prompt(session: ClaudeSession):
 
     response = sandbox.commands.run(
         f"echo '{session.prompt}' | {cmd} {' '.join(claude_args)}",
-        envs={"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", "")},
         timeout=0,
     )
 
