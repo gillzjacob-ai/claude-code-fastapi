@@ -8,6 +8,10 @@ from e2b import Sandbox
 
 app = FastAPI()
 
+system_prompt = """
+GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
+"""
+
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
 sandbox_timeout = 60 * 60
 
@@ -15,15 +19,15 @@ sandbox_timeout = 60 * 60
 session_sandbox_map = {}
 
 
-class ClaudeSession(BaseModel):
+class ClaudePrompt(BaseModel):
     prompt: str
-    resume: Optional[str] = None
     repo: Optional[str] = None
 
 
+@app.post("/chat/{session}")
 @app.post("/chat")
-def prompt(session: ClaudeSession):
-    if session.resume is None:
+def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
+    if session is None:
         sandbox = Sandbox(
             template=sandbox_template,
             timeout=sandbox_timeout,
@@ -33,12 +37,12 @@ def prompt(session: ClaudeSession):
                 "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
             },
         )
-        if session.repo:
+        if prompt.repo:
             sandbox.commands.run(
-                f"git clone {session.repo} && cd {session.repo.split('/')[-1]}"
+                f"git clone {prompt.repo} && cd {prompt.repo.split('/')[-1]}"
             )
     else:
-        sandbox = Sandbox(sandbox_id=session_sandbox_map[session.resume])
+        sandbox = Sandbox(sandbox_id=session_sandbox_map[session])
 
     cmd = "claude"
     claude_args = [
@@ -49,14 +53,14 @@ def prompt(session: ClaudeSession):
         "--mcp-config",
         "/.mcp/mcp.json",
         "--append-system-prompt",
-        "GitHub PAT is already set in the environment GITHUB_PAT",
+        f'"{system_prompt}"',
     ]
-    if session.resume:
+    if session:
         claude_args.append(f"--resume")
-        claude_args.append(session.resume)
+        claude_args.append(session)
 
     response = sandbox.commands.run(
-        f"echo '{session.prompt}' | {cmd} {' '.join(claude_args)}",
+        f"echo '{prompt.prompt}' | {cmd} {' '.join(claude_args)}",
         timeout=0,
     )
 
