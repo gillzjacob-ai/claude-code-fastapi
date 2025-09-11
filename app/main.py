@@ -13,7 +13,7 @@ GitHub PAT is already set in the environment GITHUB_PAT. The repository is alrea
 """
 
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
-sandbox_timeout = 60 * 60
+sandbox_timeout = 60 * 60 # 1 hour
 
 # claude session id -> sandbox id
 session_sandbox_map = {}

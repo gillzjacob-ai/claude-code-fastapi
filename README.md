@@ -6,7 +6,7 @@ A FastAPI application that provides a REST API for running Claude Code in E2B sa
 
 - **Remote Claude Code Execution**: Run Claude Code commands through HTTP API endpoints
 - **Session Management**: Resume conversations across multiple requests
-- **GitHub Integration**: Clone repositories and work with code in sandboxes
+- **GitHub Integration**: Clone and push repositories to work with code in sandboxes
 - **E2B Sandbox Environment**: Isolated, secure execution environment
 - **MCP (Model Context Protocol) Support**: Enhanced capabilities through MCP servers
 
@@ -15,22 +15,26 @@ A FastAPI application that provides a REST API for running Claude Code in E2B sa
 - Python 3.12 or higher
 - E2B account and API key
 - Anthropic API key (for Claude Code)
-- GitHub Personal Access Token (optional, for repository access)
+- GitHub Personal Access Token (optional, for repository push)
+- Context7 API key (optional, for MCP Context7 server)
 
 ## Installation
 
 1. Clone the repository:
+
 ```bash
-git clone <your-repo-url>
-cd claude-fastapi
+git clone https://github.com/e2b-dev/claude-code-fastapi
+cd claude-code-fastapi
 ```
 
 2. Install dependencies using uv (recommended):
+
 ```bash
 uv sync
 ```
 
 Or using pip:
+
 ```bash
 pip install -e .
 ```
@@ -47,7 +51,14 @@ E2B_API_KEY=your_e2b_api_key_here
 # Optional
 E2B_SANDBOX_TEMPLATE=claude-code-dev  # or claude-code for production
 GITHUB_PAT=your_github_personal_access_token_here
+CONTEXT7_API_KEY=your_context7_api_key_here  # for MCP Context7 server
 ```
+
+**Environment Variable Propagation**: The following environment variables are automatically passed to each E2B sandbox:
+
+- `GITHUB_PAT` - For GitHub repository access
+- `CONTEXT7_API_KEY` - For MCP Context7 server functionality
+- `ANTHROPIC_API_KEY` - For Claude Code execution
 
 ## Building Templates
 
@@ -61,8 +72,9 @@ python build_dev.py
 ```
 
 This creates a template with:
-- 1 CPU core
-- 1024 MB memory
+
+- 2 CPU core
+- 4096 MB memory
 - Alias: `claude-code-dev`
 
 ### Production Template
@@ -75,13 +87,15 @@ python build.py
 ```
 
 This creates a template with:
-- 1 CPU core
-- 1024 MB memory
+
+- 2 CPU core
+- 4096 MB memory
 - Alias: `claude-code`
 
 ## Running the Application
 
 1. Start the FastAPI server:
+
 ```bash
 uvicorn app.main:app --reload
 ```
@@ -89,6 +103,7 @@ uvicorn app.main:app --reload
 The API will be available at `http://localhost:8000`
 
 2. Access the interactive API documentation:
+
 ```
 http://localhost:8000/docs
 ```
@@ -97,7 +112,7 @@ http://localhost:8000/docs
 
 ### POST /chat
 
-Send a request to execute Claude Code commands:
+Start a new conversation with Claude Code:
 
 ```bash
 curl -X POST "http://localhost:8000/chat" \
@@ -108,15 +123,28 @@ curl -X POST "http://localhost:8000/chat" \
   }'
 ```
 
+### POST /chat/{session}
+
+Resume an existing conversation using a session ID:
+
+```bash
+curl -X POST "http://localhost:8000/chat/038b769b-4717-47ca-be02-2a49bd7da978" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Now modify the script to accept a name parameter"
+  }'
+```
+
 #### Request Body
 
 ```json
 {
-  "prompt": "string",           // Required: The prompt/command for Claude Code
-  "resume": "string",           // Optional: Session ID to resume conversation
-  "repo": "string"              // Optional: GitHub repository URL to clone
+  "prompt": "string", // Required: The prompt/command for Claude Code
+  "repo": "string" // Optional: GitHub repository URL to clone (only for new sessions)
 }
 ```
+
+**Note**: When using `/chat/{session}`, the `repo` parameter is ignored as the repository is already cloned in the existing sandbox session.
 
 #### Response
 
@@ -145,40 +173,18 @@ curl -X POST "http://localhost:8000/chat" \
 }
 ```
 
-### Example Usage
-
-1. **Initial Request**:
-```bash
-curl -X POST "http://localhost:8000/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Create a Python script that prints hello world",
-    "repo": "https://github.com/example/my-project"
-  }'
-```
-
-2. **Resume Conversation**:
-```bash
-curl -X POST "http://localhost:8000/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Now modify the script to accept a name parameter",
-    "resume": "session_id_from_previous_response"
-  }'
-```
-
 ### MCP Servers
 
 You can add your own MCP servers to Claude Code by editing the [template/.mcp.json](template/.mcp.json) file.
 
 ```json
 {
-  "servers": {
-    "github": {
+  "mcpServers": {
+    "context7": {
       "type": "http",
-      "url": "https://api.githubcopilot.com/mcp/",
+      "url": "https://mcp.context7.com/mcp",
       "headers": {
-        "Authorization": "Bearer ${GITHUB_PAT}"
+        "Authorization": "Bearer ${CONTEXT7_API_KEY}"
       }
     }
   }
