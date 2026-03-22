@@ -7,7 +7,18 @@ from fastapi import FastAPI, HTTPException
 from e2b import Sandbox
 
 app = FastAPI()
+from fastapi import Request, HTTPException
+import os
 
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+    token = request.headers.get("Authorization")
+    expected = f"Bearer {os.getenv('API_AUTH_TOKEN', '')}"
+    if not token or token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return await call_next(request)
 system_prompt = """
 GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
 """
