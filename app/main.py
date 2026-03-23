@@ -69,7 +69,7 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
         claude_args.append(f"--resume")
         claude_args.append(session)
 
-   response = sandbox.commands.run(
+  response = sandbox.commands.run(
         f"echo {json.dumps(prompt.prompt)} | {cmd} {' '.join(claude_args)}",
         timeout=0,
     )
