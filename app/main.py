@@ -1,24 +1,17 @@
 import json
 import os
+import base64
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from e2b import Sandbox
-from supabase import create_client
-import base64
 
 app = FastAPI()
 from fastapi import Request, HTTPException
 import os
 
-# Supabase client for file uploads
-supabase_url = os.getenv("SUPABASE_URL", "")
-supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
-supabase = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
-
-ARTIFACT_BUCKET = "agent-artifacts"
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 OUTPUT_DIR = "/home/user/output"
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -55,12 +48,9 @@ class ClaudePrompt(BaseModel):
     repo: Optional[str] = None
 
 
-def extract_and_upload_files(sandbox, session_id: str, agent_id: str = "default"):
-    """Extract files from sandbox output directory and upload to Supabase Storage."""
+def extract_files_from_sandbox(sandbox):
+    """Extract files from sandbox output directory and return as base64."""
     files = []
-
-    if not supabase:
-        return files
 
     try:
         # Check if output directory exists
@@ -99,8 +89,9 @@ def extract_and_upload_files(sandbox, session_id: str, agent_id: str = "default"
                 # Read file content from sandbox
                 content = sandbox.files.read(file_path)
 
-                # Upload to Supabase Storage
-                storage_path = f"{session_id}/{agent_id}/{filename}"
+                # Convert to base64
+                file_bytes = content if isinstance(content, bytes) else content.encode("utf-8")
+                file_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
                 # Determine content type
                 content_types = {
@@ -124,28 +115,12 @@ def extract_and_upload_files(sandbox, session_id: str, agent_id: str = "default"
                 }
                 content_type = content_types.get(file_ext, "application/octet-stream")
 
-                # Upload to Supabase Storage
-                # Content from sandbox.files.read() returns bytes
-                file_content = content if isinstance(content, bytes) else content.encode("utf-8")
-
-                supabase.storage.from_(ARTIFACT_BUCKET).upload(
-                    path=storage_path,
-                    file=file_content,
-                    file_options={"content-type": content_type},
-                )
-
-                # Generate signed URL (24 hours)
-                signed = supabase.storage.from_(ARTIFACT_BUCKET).create_signed_url(
-                    path=storage_path,
-                    expires_in=86400,  # 24 hours
-                )
-
                 files.append({
                     "filename": filename,
                     "file_type": file_ext,
+                    "content_type": content_type,
                     "size_bytes": file_size,
-                    "download_url": signed["signedURL"] if isinstance(signed, dict) else signed.signed_url,
-                    "storage_path": storage_path,
+                    "data": file_base64,
                 })
 
             except Exception as e:
@@ -208,9 +183,8 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     claude_response = json.loads(response.stdout)
     session_sandbox_map[claude_response["session_id"]] = sandbox.sandbox_id
 
-    # Extract files from sandbox and upload to Supabase Storage
-    agent_id = claude_response.get("session_id", "default")
-    files = extract_and_upload_files(sandbox, claude_response["session_id"], agent_id)
+    # Extract files from sandbox as base64
+    files = extract_files_from_sandbox(sandbox)
 
     # Add files to the response
     claude_response["files"] = files
