@@ -72,7 +72,7 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
         claude_args.append(session)
 
     response = sandbox.commands.run(
-        f"echo '{prompt.prompt}' | {cmd} {' '.join(claude_args)}",
+      f"echo {json.dumps(prompt.prompt)} | {cmd} {' '.join(claude_args)}",
         timeout=0,
     )
 
