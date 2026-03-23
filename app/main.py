@@ -57,13 +57,11 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
         sandbox = Sandbox.connect(sandbox_id=session_sandbox_map[session])
 
     cmd = "claude"
-    claude_args = [
+  claude_args = [
         "-p",
         "--dangerously-skip-permissions",
         "--output-format",
         "json",
-        "--mcp-config",
-        "/.mcp/mcp.json",
         "--append-system-prompt",
         f'"{system_prompt}"',
     ]
