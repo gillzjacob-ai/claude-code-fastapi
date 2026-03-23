@@ -23,18 +23,19 @@ async def auth_middleware(request: Request, call_next):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return await call_next(request)
 
-system_prompt = """
-GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
-
-IMPORTANT: When you produce a substantial deliverable (report, document, plan, code, spreadsheet, website, etc.), also save it as a properly formatted file in /home/user/output/. Use appropriate file formats:
-- Reports and plans: save as .md (markdown)
-- Data and tables: save as .csv
-- Websites and apps: save the .html, .css, and .js files
-- Code projects: save all source files
-- Presentations: save as .md with clear slide breaks
-Create the /home/user/output/ directory first with: mkdir -p /home/user/output
-Always announce any files you create by noting the filename at the end of your response.
-"""
+SYSTEM_PROMPT = (
+    "GitHub PAT is already set in the environment GITHUB_PAT. "
+    "The repository is already cloned in the sandbox and the working directory is the repository root.\n\n"
+    "IMPORTANT: When you produce a substantial deliverable (report, document, plan, code, spreadsheet, website, etc.), "
+    "also save it as a properly formatted file in /home/user/output/. Use appropriate file formats:\n"
+    "- Reports and plans: save as .md (markdown)\n"
+    "- Data and tables: save as .csv\n"
+    "- Websites and apps: save the .html, .css, and .js files\n"
+    "- Code projects: save all source files\n"
+    "- Presentations: save as .md with clear slide breaks\n"
+    "Create the /home/user/output/ directory first with: mkdir -p /home/user/output\n"
+    "Always announce any files you create by noting the filename at the end of your response."
+)
 
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
 sandbox_timeout = 60 * 60  # 1 hour
@@ -156,6 +157,11 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     # Create output directory in sandbox
     sandbox.commands.run(f"mkdir -p {OUTPUT_DIR}")
 
+    # Write prompt and system prompt to files inside the sandbox
+    # This avoids all shell escaping issues with special characters
+    sandbox.files.write("/tmp/prompt.txt", prompt.prompt)
+    sandbox.files.write("/tmp/system_prompt.txt", SYSTEM_PROMPT)
+
     cmd = "claude"
     claude_args = [
         "-p",
@@ -164,16 +170,16 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
         "json",
         "--mcp-config",
         "/.mcp/mcp.json",
-        "--append-system-prompt",
-        f'"{system_prompt}"',
     ]
 
     if session:
-        claude_args.append(f"--resume")
+        claude_args.append("--resume")
         claude_args.append(session)
 
+    # Use cat to pipe prompt and read system prompt from files
+    # This safely handles any special characters in the prompt text
     response = sandbox.commands.run(
-        f"echo '{prompt.prompt}' | {cmd} {' '.join(claude_args)}",
+        f"cat /tmp/prompt.txt | {cmd} {' '.join(claude_args)} --append-system-prompt \"$(cat /tmp/system_prompt.txt)\"",
         timeout=0,
     )
 
