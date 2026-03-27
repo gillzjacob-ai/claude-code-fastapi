@@ -169,7 +169,7 @@ def run_agent_in_background(job_id: str, prompt_text: str, repo: Optional[str], 
             "-p",
             "--dangerously-skip-permissions",
             "--output-format", "json",
-            "--model", "claude-sonnet-4-20250514",   # Fix 1: pinned model
+            "--model", "claude-sonnet-4-6",   # Fix 1: pinned model
             "--append-system-prompt", shlex.quote(system_prompt),
         ]
 
