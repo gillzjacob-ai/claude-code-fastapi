@@ -288,6 +288,38 @@ def run_agent_in_background(
         active_sandboxes[sandbox.sandbox_id] = sandbox
         update_job(job_id, sandbox_id=sandbox.sandbox_id)
 
+        # Write .mcp.json into the sandbox at runtime with current Composio URL
+        # This overrides the baked-in template config so we don't need to rebuild the E2B image
+        mcp_config = {
+            "mcpServers": {
+                "context7": {
+                    "type": "http",
+                    "url": "https://mcp.context7.com/mcp",
+                    "headers": {
+                        "Authorization": f"Bearer {sandbox_envs.get('CONTEXT7_API_KEY', '')}"
+                    }
+                }
+            }
+        }
+        if composio_mcp_url:
+            mcp_config["mcpServers"]["composio"] = {
+                "type": "http",
+                "url": composio_mcp_url,
+                "headers": {
+                    "Authorization": f"Bearer {composio_api_key or ''}"
+                }
+            }
+        mcp_json_str = json.dumps(mcp_config, indent=2)
+        sandbox.commands.run(
+            f"mkdir -p /.mcp && echo {shlex.quote(mcp_json_str)} > /.mcp/mcp.json",
+            timeout=10,
+        )
+        # Also write to home directory in case Claude Code looks there
+        sandbox.commands.run(
+            f"echo {shlex.quote(mcp_json_str)} > /home/user/.mcp.json",
+            timeout=10,
+        )
+
         # Build Claude CLI command
         cmd = "claude"
         claude_args = [
