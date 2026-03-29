@@ -310,13 +310,14 @@ def run_agent_in_background(
                 }
             }
         mcp_json_str = json.dumps(mcp_config, indent=2)
-        sandbox.commands.run(
-            f"mkdir -p /.mcp && echo {shlex.quote(mcp_json_str)} > /.mcp/mcp.json",
-            timeout=10,
-        )
-        # Also write to home directory in case Claude Code looks there
+        # Write to home directory where Claude Code looks for .mcp.json
         sandbox.commands.run(
             f"echo {shlex.quote(mcp_json_str)} > /home/user/.mcp.json",
+            timeout=10,
+        )
+        # Also try the working directory
+        sandbox.commands.run(
+            f"echo {shlex.quote(mcp_json_str)} > .mcp.json",
             timeout=10,
         )
 
