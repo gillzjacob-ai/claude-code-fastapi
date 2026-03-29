@@ -507,7 +507,7 @@ def get_result(job_id: str):
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.post("/schedules")
 def create_schedule(body: ScheduleCreate):
- result = db.table("schedules").insert({
+    result = db.table("schedules").insert({
         "name": body.name,
         "agent_prompt": body.agent_prompt,
         "cron_expression": body.cron_expression,
@@ -800,11 +800,3 @@ def _get_mime_type(ext: str) -> str:
 def health():
     scheduled_jobs = len(scheduler.get_jobs())
     return {"status": "ok", "scheduled_jobs": scheduled_jobs}
-
-
-# ──────────────────────────────────────────────
-# Health check
-# ──────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok"}
