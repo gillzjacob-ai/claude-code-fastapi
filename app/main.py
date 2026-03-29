@@ -75,6 +75,8 @@ active_sandboxes = {}
 class ClaudePrompt(BaseModel):
     prompt: str
     repo: Optional[str] = None
+    composio_mcp_url: Optional[str] = None
+    composio_api_key: Optional[str] = None
 
 
 class FileInfo(BaseModel):
@@ -90,7 +92,9 @@ class ScheduleCreate(BaseModel):
     cron_expression: str
     enabled: bool = True
     sandbox_template: Optional[str] = None
-
+    composio_entity_id: Optional[str] = None
+    composio_api_key: Optional[str] = None
+    composio_mcp_url: Optional[str] = None
 
 class ScheduleUpdate(BaseModel):
     name: Optional[str] = None
@@ -503,12 +507,15 @@ def get_result(job_id: str):
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.post("/schedules")
 def create_schedule(body: ScheduleCreate):
-    result = db.table("schedules").insert({
+ result = db.table("schedules").insert({
         "name": body.name,
         "agent_prompt": body.agent_prompt,
         "cron_expression": body.cron_expression,
         "enabled": body.enabled,
         "sandbox_template": body.sandbox_template,
+        "composio_entity_id": body.composio_entity_id,
+        "composio_api_key": body.composio_api_key,
+        "composio_mcp_url": body.composio_mcp_url,
         "last_state": None,
         "last_run_at": None,
     }).execute()
