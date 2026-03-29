@@ -1,11 +1,13 @@
 import json
 import os
+import re
 import shlex
 import uuid
 import threading
 from typing import Optional
 from datetime import datetime, timezone
 
+import httpx
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,9 +15,9 @@ from apscheduler.triggers.cron import CronTrigger
 from e2b import Sandbox
 from supabase import create_client, Client
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Startup Validation
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 REQUIRED_ENV_VARS = ["ANTHROPIC_API_KEY", "E2B_API_KEY", "API_AUTH_TOKEN"]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
@@ -32,17 +34,17 @@ if not SUPABASE_URL or not SUPABASE_KEY:
         "Set these in your Railway environment to enable persistent job tracking."
     )
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Supabase Client
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Auth middleware
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if request.url.path == "/health":
@@ -54,9 +56,9 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Config
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 system_prompt = """
 GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
 """
@@ -64,14 +66,13 @@ GitHub PAT is already set in the environment GITHUB_PAT. The repository is alrea
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
 sandbox_timeout = 60 * 60  # 1 hour
 
-# Local cache of sandbox objects (still needed for active connections)
-# This is a runtime cache only â€” the source of truth is Supabase
+# Local cache of sandbox objects (runtime only, source of truth is Supabase)
 active_sandboxes = {}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Models
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 class ClaudePrompt(BaseModel):
     prompt: str
     repo: Optional[str] = None
@@ -96,6 +97,7 @@ class ScheduleCreate(BaseModel):
     composio_api_key: Optional[str] = None
     composio_mcp_url: Optional[str] = None
 
+
 class ScheduleUpdate(BaseModel):
     name: Optional[str] = None
     agent_prompt: Optional[str] = None
@@ -103,9 +105,9 @@ class ScheduleUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Supabase Helpers â€” Jobs
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# Supabase Helpers - Jobs
+# ------------------------------------------
 def create_job(job_id: str, schedule_id: Optional[str] = None):
     """Insert a new job record into Supabase."""
     db.table("agent_jobs").insert({
@@ -154,9 +156,9 @@ def get_sandbox_for_session(session_id: str) -> Optional[str]:
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Supabase Helpers â€” Schedules & Agent State
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# Supabase Helpers - Schedules & Agent State
+# ------------------------------------------
 def get_all_enabled_schedules():
     """Fetch all enabled schedules from Supabase."""
     result = db.table("schedules").select("*").eq("enabled", True).execute()
@@ -178,11 +180,7 @@ def update_schedule(schedule_id: str, **fields):
 
 
 def get_agent_state(schedule_id: str) -> dict:
-    """
-    Load the persisted state for a scheduled agent.
-    Returns the last_state JSONB from the schedules table.
-    This is what lets 'check email every 4h' skip already-processed items.
-    """
+    """Load the persisted state for a scheduled agent."""
     result = db.table("schedules").select("last_state").eq("id", schedule_id).execute()
     if result.data and len(result.data) > 0:
         return result.data[0].get("last_state") or {}
@@ -190,13 +188,7 @@ def get_agent_state(schedule_id: str) -> dict:
 
 
 def save_agent_state(schedule_id: str, state: dict):
-    """
-    Persist the agent's state after a scheduled run.
-    Stored as JSONB in schedules.last_state.
-    Claude is instructed to return a JSON block with updated state
-    (e.g. last processed email IDs, last checked ad metrics timestamp, etc.)
-    and we extract + save it here.
-    """
+    """Persist the agent's state after a scheduled run."""
     update_schedule(
         schedule_id,
         last_state=state,
@@ -205,10 +197,7 @@ def save_agent_state(schedule_id: str, state: dict):
 
 
 def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Optional[str] = None, error: Optional[str] = None):
-    """
-    Insert a row into agent_runs for full run history.
-    This is the audit trail â€” schedules.last_state is just the live snapshot.
-    """
+    """Insert a row into agent_runs for full run history."""
     db.table("agent_runs").insert({
         "id": str(uuid.uuid4()),
         "schedule_id": schedule_id,
@@ -220,26 +209,67 @@ def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Option
     }).execute()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# Composio MCP Session Refresh
+# ------------------------------------------
+def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
+    """
+    Create a fresh Composio session for the user and return the MCP URL.
+    Called before each scheduled run to ensure the MCP URL hasn't expired.
+    """
+    try:
+        resp = httpx.post(
+            "https://backend.composio.dev/api/v3/tool_router/session",
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+            json={"user_id": entity_id},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        url = data.get("mcp", {}).get("url", "")
+        if url:
+            print(f"[Composio] Refreshed MCP URL for entity {entity_id}")
+            return url
+        return None
+    except Exception as e:
+        print(f"[Composio] MCP refresh failed for entity {entity_id}: {e}")
+        return None
+
+
+# ------------------------------------------
 # Core Agent Runner (shared by /chat and scheduler)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 def run_agent_in_background(
     job_id: str,
     prompt_text: str,
     repo: Optional[str],
     session: Optional[str],
     schedule_id: Optional[str] = None,
+    composio_mcp_url: Optional[str] = None,
+    composio_api_key: Optional[str] = None,
 ):
     try:
+        # Build sandbox environment variables
+        sandbox_envs = {
+            "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
+            "CONTEXT7_API_KEY": os.getenv("CONTEXT7_API_KEY", ""),
+            "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
+        }
+
+        # Inject Composio credentials if available
+        if composio_mcp_url:
+            sandbox_envs["COMPOSIO_MCP_URL"] = composio_mcp_url
+        if composio_api_key:
+            sandbox_envs["COMPOSIO_API_KEY"] = composio_api_key
+
         if session is None:
             sandbox = Sandbox.create(
                 template=sandbox_template,
                 timeout=sandbox_timeout,
-                envs={
-                    "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
-                    "CONTEXT7_API_KEY": os.getenv("CONTEXT7_API_KEY", ""),
-                    "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
-                },
+                envs=sandbox_envs,
             )
             if repo:
                 sandbox.commands.run(
@@ -305,10 +335,7 @@ def run_agent_in_background(
             session_id=claude_response.get("session_id"),
         )
 
-        # â”€â”€ Scheduled agent: extract & persist state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Claude is prompted to return a JSON block like:
-        #   {"__agent_state__": {"last_email_ids": [...], "last_checked_at": "..."}}
-        # We extract it here and store it for the next run.
+        # Scheduled agent: extract & persist state
         if schedule_id:
             result_text = claude_response.get("result", "") or ""
             new_state = _extract_agent_state(result_text)
@@ -331,14 +358,7 @@ def run_agent_in_background(
 def _extract_agent_state(result_text: str) -> Optional[dict]:
     """
     Extract the __agent_state__ JSON block from Claude's response.
-    Claude is instructed in the scheduled prompt to always end its response with:
-      ```json
-      {"__agent_state__": { ... }}
-      ```
-    We parse this out and store it so the next run knows what was already handled.
     """
-    import re
-    # Look for a JSON block containing __agent_state__
     pattern = r'```json\s*(\{.*?"__agent_state__".*?\})\s*```'
     match = re.search(pattern, result_text, re.DOTALL)
     if match:
@@ -350,9 +370,9 @@ def _extract_agent_state(result_text: str) -> Optional[dict]:
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Scheduler â€” runs scheduled agents on cron
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# Scheduler - runs scheduled agents on cron
+# ------------------------------------------
 scheduler = BackgroundScheduler(timezone="UTC")
 
 
@@ -389,21 +409,37 @@ IMPORTANT: At the end of your response, always include a JSON block with your up
 def _run_scheduled_agent(schedule_id: str):
     """
     Fired by APScheduler on each cron tick.
-    Loads the schedule + last state from Supabase, builds the prompt, runs Claude.
+    Loads the schedule from Supabase, refreshes Composio MCP if available,
+    builds the prompt, and runs Claude with full tool access.
     """
     schedule = get_schedule(schedule_id)
     if not schedule or not schedule.get("enabled"):
-        return  # Schedule was disabled between ticks â€” skip
+        return  # Schedule was disabled between ticks - skip
 
     job_id = str(uuid.uuid4())
     create_job(job_id, schedule_id=schedule_id)
 
     prompt_text = _build_scheduled_prompt(schedule)
-    tmpl = schedule.get("sandbox_template") or sandbox_template
+
+    # Resolve Composio MCP URL - refresh if we have entity credentials
+    composio_mcp_url = schedule.get("composio_mcp_url")
+    composio_api_key = schedule.get("composio_api_key")
+    composio_entity_id = schedule.get("composio_entity_id")
+
+    if composio_entity_id and composio_api_key:
+        fresh_url = refresh_composio_mcp_url(composio_entity_id, composio_api_key)
+        if fresh_url:
+            composio_mcp_url = fresh_url
+            # Update stored URL so it's fresh for next time
+            update_schedule(schedule_id, composio_mcp_url=fresh_url)
 
     thread = threading.Thread(
         target=run_agent_in_background,
         args=(job_id, prompt_text, None, None, schedule_id),
+        kwargs={
+            "composio_mcp_url": composio_mcp_url,
+            "composio_api_key": composio_api_key,
+        },
         daemon=True,
     )
     thread.start()
@@ -444,9 +480,9 @@ def _unregister_schedule(schedule_id: str):
         scheduler.remove_job(job_id)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# App Lifecycle â€” start/stop scheduler
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# App Lifecycle - start/stop scheduler
+# ------------------------------------------
 @app.on_event("startup")
 def startup_event():
     _load_schedules_into_scheduler()
@@ -460,9 +496,9 @@ def shutdown_event():
     print("[Scheduler] Stopped.")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# POST /chat â€” ASYNC: returns immediately with job_id
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# POST /chat - returns immediately with job_id
+# ------------------------------------------
 @app.post("/chat/{session}")
 @app.post("/chat")
 def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
@@ -472,6 +508,10 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     thread = threading.Thread(
         target=run_agent_in_background,
         args=(job_id, prompt.prompt, prompt.repo, session),
+        kwargs={
+            "composio_mcp_url": prompt.composio_mcp_url,
+            "composio_api_key": prompt.composio_api_key,
+        },
         daemon=True,
     )
     thread.start()
@@ -483,9 +523,9 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /result/{job_id} â€” Poll for agent completion
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /result/{job_id} - Poll for agent completion
+# ------------------------------------------
 @app.get("/result/{job_id}")
 def get_result(job_id: str):
     job = get_job(job_id)
@@ -502,9 +542,9 @@ def get_result(job_id: str):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# POST /schedules â€” Create a new scheduled agent
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# POST /schedules - Create a new scheduled agent
+# ------------------------------------------
 @app.post("/schedules")
 def create_schedule(body: ScheduleCreate):
     result = db.table("schedules").insert({
@@ -535,29 +575,27 @@ def create_schedule(body: ScheduleCreate):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /schedules â€” List all schedules
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /schedules - List all schedules
+# ------------------------------------------
 @app.get("/schedules")
 def list_schedules():
     result = db.table("schedules").select("*").order("created_at", desc=True).execute()
     schedules = result.data or []
-    # Attach next run time from APScheduler
     for s in schedules:
         s["next_run_at"] = _next_run_time(s["id"])
     return {"schedules": schedules}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /schedules/{schedule_id} â€” Get a single schedule + recent runs
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /schedules/{schedule_id} - Single schedule + recent runs
+# ------------------------------------------
 @app.get("/schedules/{schedule_id}")
 def get_schedule_detail(schedule_id: str):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    # Fetch last 10 runs
     runs = (
         db.table("agent_runs")
         .select("*")
@@ -572,9 +610,9 @@ def get_schedule_detail(schedule_id: str):
     return schedule
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# PATCH /schedules/{schedule_id} â€” Update a schedule
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# PATCH /schedules/{schedule_id} - Update a schedule
+# ------------------------------------------
 @app.patch("/schedules/{schedule_id}")
 def patch_schedule(schedule_id: str, body: ScheduleUpdate):
     schedule = get_schedule(schedule_id)
@@ -587,7 +625,6 @@ def patch_schedule(schedule_id: str, body: ScheduleUpdate):
 
     update_schedule(schedule_id, **updates)
 
-    # Re-register with APScheduler to pick up any cron/enabled changes
     updated = get_schedule(schedule_id)
     if updated["enabled"]:
         _register_schedule(updated)
@@ -597,9 +634,9 @@ def patch_schedule(schedule_id: str, body: ScheduleUpdate):
     return {"id": schedule_id, "updated": updates, "next_run_at": _next_run_time(schedule_id)}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# DELETE /schedules/{schedule_id} â€” Delete a schedule
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# DELETE /schedules/{schedule_id} - Delete a schedule
+# ------------------------------------------
 @app.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
     schedule = get_schedule(schedule_id)
@@ -611,9 +648,9 @@ def delete_schedule(schedule_id: str):
     return {"id": schedule_id, "deleted": True}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# POST /schedules/{schedule_id}/run â€” Trigger a schedule manually right now
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# POST /schedules/{schedule_id}/run - Trigger manually right now
+# ------------------------------------------
 @app.post("/schedules/{schedule_id}/run")
 def trigger_schedule_now(schedule_id: str):
     schedule = get_schedule(schedule_id)
@@ -625,9 +662,23 @@ def trigger_schedule_now(schedule_id: str):
 
     prompt_text = _build_scheduled_prompt(schedule)
 
+    # Refresh Composio MCP URL if credentials available
+    composio_mcp_url = schedule.get("composio_mcp_url")
+    composio_api_key = schedule.get("composio_api_key")
+    composio_entity_id = schedule.get("composio_entity_id")
+
+    if composio_entity_id and composio_api_key:
+        fresh_url = refresh_composio_mcp_url(composio_entity_id, composio_api_key)
+        if fresh_url:
+            composio_mcp_url = fresh_url
+
     thread = threading.Thread(
         target=run_agent_in_background,
         args=(job_id, prompt_text, None, None, schedule_id),
+        kwargs={
+            "composio_mcp_url": composio_mcp_url,
+            "composio_api_key": composio_api_key,
+        },
         daemon=True,
     )
     thread.start()
@@ -640,9 +691,9 @@ def trigger_schedule_now(schedule_id: str):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /schedules/{schedule_id}/state â€” View current agent state
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /schedules/{schedule_id}/state - View current agent state
+# ------------------------------------------
 @app.get("/schedules/{schedule_id}/state")
 def get_schedule_state(schedule_id: str):
     schedule = get_schedule(schedule_id)
@@ -655,9 +706,9 @@ def get_schedule_state(schedule_id: str):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# DELETE /schedules/{schedule_id}/state â€” Reset agent state (re-process everything)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# DELETE /schedules/{schedule_id}/state - Reset agent state
+# ------------------------------------------
 @app.delete("/schedules/{schedule_id}/state")
 def reset_schedule_state(schedule_id: str):
     schedule = get_schedule(schedule_id)
@@ -667,9 +718,9 @@ def reset_schedule_state(schedule_id: str):
     return {"schedule_id": schedule_id, "last_state": None, "message": "State cleared. Next run will start fresh."}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /files/{sandbox_id} â€” List files in sandbox
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /files/{sandbox_id} - List files in sandbox
+# ------------------------------------------
 @app.get("/files/{sandbox_id}")
 def list_files(sandbox_id: str):
     sandbox = _get_sandbox(sandbox_id)
@@ -709,9 +760,9 @@ def list_files(sandbox_id: str):
     return {"sandbox_id": sandbox_id, "files": [f.dict() for f in files]}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# GET /files/{sandbox_id}/download â€” Single file as base64
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
+# GET /files/{sandbox_id}/download - Single file as base64
+# ------------------------------------------
 @app.get("/files/{sandbox_id}/download")
 def download_file(sandbox_id: str, path: str):
     sandbox = _get_sandbox(sandbox_id)
@@ -736,9 +787,9 @@ def download_file(sandbox_id: str, path: str):
     }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 def _get_sandbox(sandbox_id: str) -> Sandbox:
     if sandbox_id in active_sandboxes:
         return active_sandboxes[sandbox_id]
@@ -793,9 +844,9 @@ def _get_mime_type(ext: str) -> str:
     return mime_map.get(ext, "application/octet-stream")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 # Health check
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ------------------------------------------
 @app.get("/health")
 def health():
     scheduled_jobs = len(scheduler.get_jobs())
