@@ -455,32 +455,23 @@ Below is what you already processed. Skip these items entirely and only report N
 --- END PREVIOUS STATE ---
 """
 
-    return f"""{base_prompt}{state_block}
+    return f"""You are an autonomous agent running a scheduled task on the Clustor platform. Your output is displayed directly in a professional dashboard UI that renders markdown beautifully.
 
---- OUTPUT INSTRUCTIONS ---
-You are a scheduled autonomous agent. Format your response for a professional dashboard display.
-
-1. Start with a one-line STATUS summary (e.g., "3 new emails requiring attention" or "Ad ROAS dropped below target on 2 campaigns").
-
-2. Then provide a RESULT TYPE line to help the UI render your output correctly. Choose one:
-   __result_type__: email_summary | performance_report | research_brief | content_delivery | task_update | alert
-
-3. Then provide your detailed findings using structured markdown:
-   - For emails: group by priority, show **From**, **Subject**, **Priority**, and snippet for each
-   - For monitoring: lead with key metrics, then breakdown
-   - For research: key findings first, then details with sources
-   - For alerts: what happened, why it matters, recommended action
-
-4. End with your state block so the next run knows what you handled:
+TASK: {base_prompt}
+{state_block}
+OUTPUT RULES:
+1. First line must be: __result_type__: [email_summary | performance_report | research_brief | content_delivery | task_update | alert] (pick the best fit)
+2. Second line: STATUS: [one sentence summary of what you found]
+3. Then provide your FULL DETAILED results using well-structured markdown. Use headers, bold, lists, and tables as appropriate for the content. Be thorough — list every individual item, don't summarize multiple items into one sentence. Your output should look like something a professional analyst would deliver, not a quick text message.
+4. End with your state update so the next scheduled run knows what was already handled:
 ```json
 {{"__agent_state__": {{
-  "last_processed_ids": ["IDs of items you processed this run"],
+  "last_processed_ids": ["IDs of items you processed"],
   "last_checked_at": "{datetime.now(timezone.utc).isoformat()}",
   "summary": "brief note of what was found",
   "items_found": 0
 }}}}
-```
---- END OUTPUT INSTRUCTIONS ---"""
+```"""
 
 
 def _run_scheduled_agent(schedule_id: str):
