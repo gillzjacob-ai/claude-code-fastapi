@@ -61,6 +61,18 @@ async def auth_middleware(request: Request, call_next):
 # ------------------------------------------
 system_prompt = """
 GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
+
+You are an autonomous agent in the Clustor platform. Your outputs are displayed directly to users in a professional interface. Follow these output rules:
+
+OUTPUT FORMATTING:
+- Structure your response with clear markdown sections using ## headers
+- For email tasks: list each email as a separate item with **From**, **Subject**, **Priority** (High/Medium/Low), and a one-line preview. Group by priority.
+- For monitoring/analytics tasks: lead with key metrics as a summary dashboard, then provide detailed breakdown sections.
+- For research tasks: start with a Key Findings section (3-5 bullet points), then detailed sections with sources.
+- For content creation: deliver the content directly as a polished artifact.
+- For multi-step tasks: show a brief status for each step completed.
+- Always be concise but thorough. No filler text. Every sentence should add value.
+- Never dump raw data. Always interpret and organize it for a busy professional.
 """
 
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
@@ -196,7 +208,7 @@ def save_agent_state(schedule_id: str, state: dict):
     )
 
 
-def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Optional[str] = None, error: Optional[str] = None):
+def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Optional[str] = None, error: Optional[str] = None, result_type: Optional[str] = None):
     """Insert a row into agent_runs for full run history."""
     db.table("agent_runs").insert({
         "id": str(uuid.uuid4()),
@@ -205,6 +217,7 @@ def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Option
         "status": status,
         "summary": summary,
         "error": error,
+        "result_type": result_type,
         "ran_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
 
@@ -375,11 +388,15 @@ def run_agent_in_background(
             if new_state:
                 save_agent_state(schedule_id, new_state)
 
+            # Extract result type for frontend rendering
+            result_type = _extract_result_type(result_text)
+
             record_agent_run(
                 schedule_id,
                 job_id,
                 "complete",
-                summary=result_text[:500] if result_text else None,
+                summary=result_text[:2000] if result_text else None,
+                result_type=result_type,
             )
 
     except Exception as e:
@@ -403,6 +420,17 @@ def _extract_agent_state(result_text: str) -> Optional[dict]:
     return None
 
 
+def _extract_result_type(result_text: str) -> str:
+    """
+    Extract the __result_type__ hint from Claude's response.
+    Used by the frontend to choose the right rendering component.
+    """
+    match = re.search(r'__result_type__:\s*(\w+)', result_text)
+    if match:
+        return match.group(1)
+    return "task_update"
+
+
 # ------------------------------------------
 # Scheduler - runs scheduled agents on cron
 # ------------------------------------------
@@ -411,8 +439,8 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 def _build_scheduled_prompt(schedule: dict) -> str:
     """
-    Inject the agent's last known state into the prompt so it knows
-    what was already processed and won't repeat itself.
+    Build the full prompt for a scheduled agent run.
+    Includes: base task, previous state, output formatting, and state persistence instructions.
     """
     base_prompt = schedule["agent_prompt"]
     last_state = schedule.get("last_state") or {}
@@ -421,22 +449,38 @@ def _build_scheduled_prompt(schedule: dict) -> str:
     if last_state:
         state_block = f"""
 
---- AGENT STATE FROM LAST RUN ---
-This is what you already processed in your previous run. Do NOT re-report or re-act on anything listed here.
+--- PREVIOUS RUN STATE ---
+Below is what you already processed. Skip these items entirely and only report NEW items since your last run.
 {json.dumps(last_state, indent=2)}
---- END AGENT STATE ---
+--- END PREVIOUS STATE ---
 """
 
     return f"""{base_prompt}{state_block}
 
-IMPORTANT: At the end of your response, always include a JSON block with your updated state so the next run knows what you handled. Format it exactly like this:
+--- OUTPUT INSTRUCTIONS ---
+You are a scheduled autonomous agent. Format your response for a professional dashboard display.
+
+1. Start with a one-line STATUS summary (e.g., "3 new emails requiring attention" or "Ad ROAS dropped below target on 2 campaigns").
+
+2. Then provide a RESULT TYPE line to help the UI render your output correctly. Choose one:
+   __result_type__: email_summary | performance_report | research_brief | content_delivery | task_update | alert
+
+3. Then provide your detailed findings using structured markdown:
+   - For emails: group by priority, show **From**, **Subject**, **Priority**, and snippet for each
+   - For monitoring: lead with key metrics, then breakdown
+   - For research: key findings first, then details with sources
+   - For alerts: what happened, why it matters, recommended action
+
+4. End with your state block so the next run knows what you handled:
 ```json
 {{"__agent_state__": {{
-  "last_processed_ids": ["list any IDs, email IDs, ad IDs, etc. you handled"],
+  "last_processed_ids": ["IDs of items you processed this run"],
   "last_checked_at": "{datetime.now(timezone.utc).isoformat()}",
-  "notes": "any other state you want to remember for next run"
+  "summary": "brief note of what was found",
+  "items_found": 0
 }}}}
-```"""
+```
+--- END OUTPUT INSTRUCTIONS ---"""
 
 
 def _run_scheduled_agent(schedule_id: str):
