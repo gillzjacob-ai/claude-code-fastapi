@@ -59,18 +59,22 @@ async def auth_middleware(request: Request, call_next):
 # ------------------------------------------
 # Config
 # ------------------------------------------
-system_prompt = """
+# System prompt for Tier 2 (sandbox/Claude Code CLI) — coding tasks only
+sandbox_system_prompt = """
 GitHub PAT is already set in the environment GITHUB_PAT. The repository is already cloned in the sandbox and the working directory is the repository root.
-
-You are an autonomous agent in the Clustor platform. Your outputs are displayed directly to users in a professional dashboard interface that renders markdown.
-
-OUTPUT RULES:
-- Never use emojis in your output. Use text labels like [HIGH], [MEDIUM], [LOW] instead.
-- Structure your response with clear markdown: ## headers, **bold**, bullet lists, tables as appropriate.
-- Be thorough — list every individual item with full details. Do not compress multiple items into one sentence.
-- Write like a professional analyst delivering a briefing, not a chatbot sending a text message.
-- Never dump raw data. Always interpret and organize it for a busy professional.
 """
+
+# System prompt for Tier 1 (direct API) — all non-coding scheduled tasks
+TIER1_SYSTEM_PROMPT = """You are an autonomous agent on the Clustor platform. Your output goes directly to users in a professional dashboard. Users see ONLY your final output — nothing else.
+
+CRITICAL OUTPUT RULES:
+- NEVER include your thinking process, planning, or internal reasoning. No "Let me check...", "I now have the data...", "Let me compose...", "I'll start by...", "First I need to..." — none of that. Only deliver the final result.
+- NEVER use emojis. Use text labels like [HIGH], [MEDIUM], [LOW] for priority.
+- Structure with clean markdown: ## headers, **bold**, bullet lists, tables as appropriate for the content.
+- Be thorough — list every individual item with full details. Do not compress multiple items into one sentence.
+- Write like a professional analyst delivering a finished briefing to a CEO. No filler, no narration of your process, no chatbot tone.
+- Never dump raw data. Always interpret and organize for a busy professional.
+- If the task involves creating charts, reports, or visualizations, produce the actual deliverable — not a description of what you would create."""
 
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
 sandbox_timeout = 60 * 60  # 1 hour
@@ -105,6 +109,7 @@ class ScheduleCreate(BaseModel):
     composio_entity_id: Optional[str] = None
     composio_api_key: Optional[str] = None
     composio_mcp_url: Optional[str] = None
+    tier: Optional[str] = "api"  # "api" (Tier 1) or "sandbox" (Tier 2) — set by Task Architect
 
 
 class ScheduleUpdate(BaseModel):
@@ -118,7 +123,6 @@ class ScheduleUpdate(BaseModel):
 # Supabase Helpers - Jobs
 # ------------------------------------------
 def create_job(job_id: str, schedule_id: Optional[str] = None):
-    """Insert a new job record into Supabase."""
     db.table("agent_jobs").insert({
         "job_id": job_id,
         "status": "processing",
@@ -131,13 +135,11 @@ def create_job(job_id: str, schedule_id: Optional[str] = None):
 
 
 def update_job(job_id: str, **fields):
-    """Update a job record in Supabase."""
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
     db.table("agent_jobs").update(fields).eq("job_id", job_id).execute()
 
 
 def get_job(job_id: str):
-    """Fetch a job record from Supabase."""
     result = db.table("agent_jobs").select("*").eq("job_id", job_id).execute()
     if result.data and len(result.data) > 0:
         return result.data[0]
@@ -145,7 +147,6 @@ def get_job(job_id: str):
 
 
 def save_session_sandbox(session_id: str, sandbox_id: str):
-    """Persist the session-to-sandbox mapping in Supabase."""
     db.table("session_sandboxes").upsert({
         "session_id": session_id,
         "sandbox_id": sandbox_id,
@@ -153,7 +154,6 @@ def save_session_sandbox(session_id: str, sandbox_id: str):
 
 
 def get_sandbox_for_session(session_id: str) -> Optional[str]:
-    """Look up the sandbox ID for a given session."""
     result = (
         db.table("session_sandboxes")
         .select("sandbox_id")
@@ -169,13 +169,11 @@ def get_sandbox_for_session(session_id: str) -> Optional[str]:
 # Supabase Helpers - Schedules & Agent State
 # ------------------------------------------
 def get_all_enabled_schedules():
-    """Fetch all enabled schedules from Supabase."""
     result = db.table("schedules").select("*").eq("enabled", True).execute()
     return result.data or []
 
 
 def get_schedule(schedule_id: str):
-    """Fetch a single schedule by ID."""
     result = db.table("schedules").select("*").eq("id", schedule_id).execute()
     if result.data and len(result.data) > 0:
         return result.data[0]
@@ -183,13 +181,11 @@ def get_schedule(schedule_id: str):
 
 
 def update_schedule(schedule_id: str, **fields):
-    """Update a schedule record."""
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
     db.table("schedules").update(fields).eq("id", schedule_id).execute()
 
 
 def get_agent_state(schedule_id: str) -> dict:
-    """Load the persisted state for a scheduled agent."""
     result = db.table("schedules").select("last_state").eq("id", schedule_id).execute()
     if result.data and len(result.data) > 0:
         return result.data[0].get("last_state") or {}
@@ -197,7 +193,6 @@ def get_agent_state(schedule_id: str) -> dict:
 
 
 def save_agent_state(schedule_id: str, state: dict):
-    """Persist the agent's state after a scheduled run."""
     update_schedule(
         schedule_id,
         last_state=state,
@@ -206,7 +201,6 @@ def save_agent_state(schedule_id: str, state: dict):
 
 
 def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Optional[str] = None, error: Optional[str] = None, result_type: Optional[str] = None):
-    """Insert a row into agent_runs for full run history."""
     db.table("agent_runs").insert({
         "id": str(uuid.uuid4()),
         "schedule_id": schedule_id,
@@ -223,10 +217,6 @@ def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Option
 # Composio MCP Session Refresh
 # ------------------------------------------
 def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
-    """
-    Create a fresh Composio session for the user and return the MCP URL.
-    Called before each scheduled run to ensure the MCP URL hasn't expired.
-    """
     try:
         resp = httpx.post(
             "https://backend.composio.dev/api/v3/tool_router/session",
@@ -250,9 +240,162 @@ def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
 
 
 # ------------------------------------------
-# Core Agent Runner (shared by /chat and scheduler)
+# Tier 1: Direct Claude API with MCP tool-use agent loop
+# Primary path for all scheduled non-coding tasks.
+# Claude calls tools, gets results, decides next steps, loops until done.
 # ------------------------------------------
-def run_agent_in_background(
+def run_tier1_agent(
+    job_id: str,
+    prompt_text: str,
+    schedule_id: str,
+    composio_mcp_url: Optional[str] = None,
+    composio_api_key: Optional[str] = None,
+):
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16000,
+            "system": TIER1_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt_text}],
+        }
+
+        # Add Composio MCP — gives Claude access to Gmail, Slack, GitHub, etc.
+        if composio_mcp_url:
+            headers["anthropic-beta"] = "mcp-client-2025-11-20"
+            mcp_server = {
+                "type": "url",
+                "url": composio_mcp_url,
+                "name": "composio",
+            }
+            if composio_api_key and "api_key=" not in composio_mcp_url:
+                mcp_server["authorization_token"] = composio_api_key
+            request_body["mcp_servers"] = [mcp_server]
+            request_body["tools"] = [
+                {"type": "mcp_toolset", "mcp_server_name": "composio"},
+            ]
+
+        print(f"[Tier1] Starting agent for schedule {schedule_id}, job {job_id}, mcp={bool(composio_mcp_url)}")
+
+        # Agent loop — Claude calls tools, API executes MCP tools server-side,
+        # Claude sees results, decides next step, repeats until done
+        messages = [{"role": "user", "content": prompt_text}]
+        total_input_tokens = 0
+        total_output_tokens = 0
+        max_iterations = 25
+        final_text = ""
+        iteration = 0
+
+        for iteration in range(max_iterations):
+            request_body["messages"] = messages
+
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=request_body,
+                timeout=120,
+            )
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                import time
+                time.sleep(3)
+                resp = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=request_body,
+                    timeout=120,
+                )
+
+            if not resp.is_success:
+                error_text = resp.text
+                print(f"[Tier1] API error iteration {iteration}: {resp.status_code}")
+                update_job(job_id, status="error", error=f"API error [{resp.status_code}]: {error_text[:500]}")
+                record_agent_run(schedule_id, job_id, "error", error=error_text[:500])
+                return
+
+            result = resp.json()
+
+            usage = result.get("usage", {})
+            total_input_tokens += usage.get("input_tokens", 0)
+            total_output_tokens += usage.get("output_tokens", 0)
+
+            content_blocks = result.get("content", [])
+            text_blocks = [b for b in content_blocks if b.get("type") == "text"]
+            iteration_text = "\n".join(b.get("text", "") for b in text_blocks)
+            if iteration_text:
+                final_text += iteration_text
+
+            stop_reason = result.get("stop_reason", "end_turn")
+
+            if stop_reason == "end_turn":
+                print(f"[Tier1] Complete after {iteration + 1} iterations, {len(final_text)} chars")
+                break
+
+            # Tool use — add assistant response and continue the loop
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            # For MCP tools, build tool_result placeholders to continue conversation
+            tool_blocks = [b for b in content_blocks if b.get("type") in ("tool_use", "mcp_tool_use")]
+            if tool_blocks:
+                tool_results = []
+                for block in tool_blocks:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.get("id", ""),
+                        "content": "Executed. Continue with the task.",
+                    })
+                messages.append({"role": "user", "content": tool_results})
+                print(f"[Tier1] Iteration {iteration + 1}: {len(tool_blocks)} tool calls")
+            else:
+                break
+
+        # Calculate cost
+        input_cost = (total_input_tokens / 1_000_000) * 3
+        output_cost = (total_output_tokens / 1_000_000) * 15
+        total_cost = round(input_cost + output_cost, 4)
+
+        print(f"[Tier1] Tokens: {total_input_tokens} in, {total_output_tokens} out, ${total_cost}")
+
+        result_payload = {
+            "result": final_text,
+            "total_cost_usd": total_cost,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "iterations": iteration + 1,
+            "tier": "api",
+        }
+
+        update_job(job_id, status="complete", result=result_payload)
+
+        new_state = _extract_agent_state(final_text)
+        if new_state:
+            save_agent_state(schedule_id, new_state)
+
+        result_type = _extract_result_type(final_text)
+        record_agent_run(
+            schedule_id, job_id, "complete",
+            summary=final_text[:2000] if final_text else None,
+            result_type=result_type,
+        )
+
+    except Exception as e:
+        print(f"[Tier1] Error job {job_id}: {e}")
+        update_job(job_id, status="error", error=str(e))
+        record_agent_run(schedule_id, job_id, "error", error=str(e))
+
+
+# ------------------------------------------
+# Tier 2: Sandbox Agent Runner (Claude Code CLI)
+# ONLY for tasks needing code execution, file creation, or browser automation.
+# ------------------------------------------
+def run_agent_in_sandbox(
     job_id: str,
     prompt_text: str,
     repo: Optional[str],
@@ -262,14 +405,11 @@ def run_agent_in_background(
     composio_api_key: Optional[str] = None,
 ):
     try:
-        # Build sandbox environment variables
         sandbox_envs = {
             "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
             "CONTEXT7_API_KEY": os.getenv("CONTEXT7_API_KEY", ""),
             "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
         }
-
-        # Inject Composio credentials if available
         if composio_mcp_url:
             sandbox_envs["COMPOSIO_MCP_URL"] = composio_mcp_url
         if composio_api_key:
@@ -282,9 +422,7 @@ def run_agent_in_background(
                 envs=sandbox_envs,
             )
             if repo:
-                sandbox.commands.run(
-                    f"git clone {repo} && cd {repo.split('/')[-1]}"
-                )
+                sandbox.commands.run(f"git clone {repo} && cd {repo.split('/')[-1]}")
         else:
             sandbox_id = get_sandbox_for_session(session)
             if not sandbox_id:
@@ -294,20 +432,16 @@ def run_agent_in_background(
                 return
             sandbox = Sandbox.connect(sandbox_id=sandbox_id)
 
-        # Store sandbox reference in local cache
         active_sandboxes[sandbox.sandbox_id] = sandbox
         update_job(job_id, sandbox_id=sandbox.sandbox_id)
 
-        # Write .mcp.json into the sandbox at runtime with current Composio URL
-        # This overrides the baked-in template config so we don't need to rebuild the E2B image
+        # Write .mcp.json into the sandbox at runtime
         mcp_config = {
             "mcpServers": {
                 "context7": {
                     "type": "http",
                     "url": "https://mcp.context7.com/mcp",
-                    "headers": {
-                        "Authorization": f"Bearer {sandbox_envs.get('CONTEXT7_API_KEY', '')}"
-                    }
+                    "headers": {"Authorization": f"Bearer {sandbox_envs.get('CONTEXT7_API_KEY', '')}"}
                 }
             }
         }
@@ -315,42 +449,26 @@ def run_agent_in_background(
             mcp_config["mcpServers"]["composio"] = {
                 "type": "http",
                 "url": composio_mcp_url,
-                "headers": {
-                    "Authorization": f"Bearer {composio_api_key or ''}"
-                }
+                "headers": {"Authorization": f"Bearer {composio_api_key or ''}"}
             }
         mcp_json_str = json.dumps(mcp_config, indent=2)
-        # Write to home directory where Claude Code looks for .mcp.json
-        sandbox.commands.run(
-            f"echo {shlex.quote(mcp_json_str)} > /home/user/.mcp.json",
-            timeout=10,
-        )
-        # Also try the working directory
-        sandbox.commands.run(
-            f"echo {shlex.quote(mcp_json_str)} > .mcp.json",
-            timeout=10,
-        )
+        sandbox.commands.run(f"echo {shlex.quote(mcp_json_str)} > /home/user/.mcp.json", timeout=10)
+        sandbox.commands.run(f"echo {shlex.quote(mcp_json_str)} > .mcp.json", timeout=10)
 
-        # Build Claude CLI command
         cmd = "claude"
         claude_args = [
             "-p",
             "--dangerously-skip-permissions",
             "--output-format", "json",
             "--model", "claude-sonnet-4-6",
-            "--append-system-prompt", shlex.quote(system_prompt),
+            "--append-system-prompt", shlex.quote(sandbox_system_prompt),
         ]
-
         if session:
             claude_args.append("--resume")
             claude_args.append(session)
 
-        # Write prompt to temp file to avoid shell injection
         safe_prompt = json.dumps(prompt_text)
-        sandbox.commands.run(
-            f"echo {shlex.quote(safe_prompt)} > /tmp/agent_prompt.txt",
-            timeout=30,
-        )
+        sandbox.commands.run(f"echo {shlex.quote(safe_prompt)} > /tmp/agent_prompt.txt", timeout=30)
 
         response = sandbox.commands.run(
             f"cat /tmp/agent_prompt.txt | {cmd} {' '.join(claude_args)}",
@@ -365,33 +483,25 @@ def run_agent_in_background(
 
         claude_response = json.loads(response.stdout)
 
-        # Persist session-to-sandbox mapping
         if "session_id" in claude_response:
             save_session_sandbox(claude_response["session_id"], sandbox.sandbox_id)
 
         claude_response["sandbox_id"] = sandbox.sandbox_id
 
         update_job(
-            job_id,
-            status="complete",
+            job_id, status="complete",
             result=claude_response,
             session_id=claude_response.get("session_id"),
         )
 
-        # Scheduled agent: extract & persist state
         if schedule_id:
             result_text = claude_response.get("result", "") or ""
             new_state = _extract_agent_state(result_text)
             if new_state:
                 save_agent_state(schedule_id, new_state)
-
-            # Extract result type for frontend rendering
             result_type = _extract_result_type(result_text)
-
             record_agent_run(
-                schedule_id,
-                job_id,
-                "complete",
+                schedule_id, job_id, "complete",
                 summary=result_text[:2000] if result_text else None,
                 result_type=result_type,
             )
@@ -402,10 +512,10 @@ def run_agent_in_background(
             record_agent_run(schedule_id, job_id, "error", error=str(e))
 
 
+# ------------------------------------------
+# State & Result Type Extraction
+# ------------------------------------------
 def _extract_agent_state(result_text: str) -> Optional[dict]:
-    """
-    Extract the __agent_state__ JSON block from Claude's response.
-    """
     pattern = r'```json\s*(\{.*?"__agent_state__".*?\})\s*```'
     match = re.search(pattern, result_text, re.DOTALL)
     if match:
@@ -418,10 +528,6 @@ def _extract_agent_state(result_text: str) -> Optional[dict]:
 
 
 def _extract_result_type(result_text: str) -> str:
-    """
-    Extract the __result_type__ hint from Claude's response.
-    Used by the frontend to choose the right rendering component.
-    """
     match = re.search(r'__result_type__:\s*(\w+)', result_text)
     if match:
         return match.group(1)
@@ -429,16 +535,32 @@ def _extract_result_type(result_text: str) -> str:
 
 
 # ------------------------------------------
-# Scheduler - runs scheduled agents on cron
+# Task Tier Detection for Scheduled Tasks
 # ------------------------------------------
-scheduler = BackgroundScheduler(timezone="UTC")
+def _needs_sandbox(prompt: str) -> bool:
+    """
+    Determine if a scheduled task needs a sandbox (Tier 2) or can use direct API (Tier 1).
+    Default is Tier 1. Sandbox only for code execution, file creation, browser automation.
+    """
+    sandbox_patterns = [
+        r'\b(write|create|build|generate)\s+(code|script|program|app|website|application)\b',
+        r'\b(execute|run)\s+(code|script|python|javascript|bash)\b',
+        r'\b(scrape|crawl|automate\s+browser|playwright|selenium)\b',
+        r'\b(create|generate|build)\s+(pdf|docx|xlsx|pptx|spreadsheet)\b',
+        r'\b(git\s+clone|npm\s+install|pip\s+install)\b',
+        r'\b(deploy|compile|build\s+and\s+deploy)\b',
+    ]
+    prompt_lower = prompt.lower()
+    for pattern in sandbox_patterns:
+        if re.search(pattern, prompt_lower):
+            return True
+    return False
 
 
+# ------------------------------------------
+# Scheduled Prompt Builder
+# ------------------------------------------
 def _build_scheduled_prompt(schedule: dict) -> str:
-    """
-    Build the full prompt for a scheduled agent run.
-    Includes: base task, previous state, output formatting, and state persistence instructions.
-    """
     base_prompt = schedule["agent_prompt"]
     last_state = schedule.get("last_state") or {}
 
@@ -446,10 +568,8 @@ def _build_scheduled_prompt(schedule: dict) -> str:
     if last_state:
         state_block = f"""
 
---- PREVIOUS RUN STATE ---
-Below is what you already processed. Skip these items entirely and only report NEW items since your last run.
+PREVIOUS RUN STATE (skip these items, only report NEW ones):
 {json.dumps(last_state, indent=2)}
---- END PREVIOUS STATE ---
 """
 
     return f"""You are an autonomous agent running a scheduled task on the Clustor platform. Your output is displayed directly in a professional dashboard UI that renders markdown beautifully.
@@ -471,22 +591,27 @@ OUTPUT RULES:
 ```"""
 
 
+# ------------------------------------------
+# Scheduler
+# ------------------------------------------
+scheduler = BackgroundScheduler(timezone="UTC")
+
+
 def _run_scheduled_agent(schedule_id: str):
     """
     Fired by APScheduler on each cron tick.
-    Loads the schedule from Supabase, refreshes Composio MCP if available,
-    builds the prompt, and runs Claude with full tool access.
+    Routes to Tier 1 (direct API) by default.
+    Only uses Tier 2 (sandbox) if the task needs code execution or browser automation.
     """
     schedule = get_schedule(schedule_id)
     if not schedule or not schedule.get("enabled"):
-        return  # Schedule was disabled between ticks - skip
+        return
 
     job_id = str(uuid.uuid4())
     create_job(job_id, schedule_id=schedule_id)
 
     prompt_text = _build_scheduled_prompt(schedule)
 
-    # Resolve Composio MCP URL - refresh if we have entity credentials
     composio_mcp_url = schedule.get("composio_mcp_url")
     composio_api_key = schedule.get("composio_api_key")
     composio_entity_id = schedule.get("composio_entity_id")
@@ -495,26 +620,38 @@ def _run_scheduled_agent(schedule_id: str):
         fresh_url = refresh_composio_mcp_url(composio_entity_id, composio_api_key)
         if fresh_url:
             composio_mcp_url = fresh_url
-            # Update stored URL so it's fresh for next time
             update_schedule(schedule_id, composio_mcp_url=fresh_url)
 
-    thread = threading.Thread(
-        target=run_agent_in_background,
-        args=(job_id, prompt_text, None, None, schedule_id),
-        kwargs={
-            "composio_mcp_url": composio_mcp_url,
-            "composio_api_key": composio_api_key,
-        },
-        daemon=True,
-    )
+    # Route decision: use tier from schedule record (set by Task Architect),
+    # fall back to keyword detection for old schedules without a tier
+    stored_tier = schedule.get("tier", "")
+    if stored_tier == "sandbox":
+        use_sandbox = True
+    elif stored_tier == "api":
+        use_sandbox = False
+    else:
+        use_sandbox = _needs_sandbox(schedule.get("agent_prompt", ""))
+
+    if use_sandbox:
+        print(f"[Scheduler] {schedule_id} -> Tier 2 (sandbox)")
+        thread = threading.Thread(
+            target=run_agent_in_sandbox,
+            args=(job_id, prompt_text, None, None, schedule_id),
+            kwargs={"composio_mcp_url": composio_mcp_url, "composio_api_key": composio_api_key},
+            daemon=True,
+        )
+    else:
+        print(f"[Scheduler] {schedule_id} -> Tier 1 (direct API)")
+        thread = threading.Thread(
+            target=run_tier1_agent,
+            args=(job_id, prompt_text, schedule_id),
+            kwargs={"composio_mcp_url": composio_mcp_url, "composio_api_key": composio_api_key},
+            daemon=True,
+        )
     thread.start()
 
 
 def _load_schedules_into_scheduler():
-    """
-    On startup, load all enabled schedules from Supabase and register them
-    with APScheduler. Called once at app startup.
-    """
     schedules = get_all_enabled_schedules()
     for schedule in schedules:
         _register_schedule(schedule)
@@ -522,9 +659,7 @@ def _load_schedules_into_scheduler():
 
 
 def _register_schedule(schedule: dict):
-    """Add or replace a schedule in APScheduler."""
     job_id = f"schedule_{schedule['id']}"
-    # Remove existing job if it's already registered (for updates)
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
     if schedule.get("enabled"):
@@ -534,19 +669,18 @@ def _register_schedule(schedule: dict):
             id=job_id,
             args=[schedule["id"]],
             replace_existing=True,
-            misfire_grace_time=300,  # 5 min grace window if server was down
+            misfire_grace_time=300,
         )
 
 
 def _unregister_schedule(schedule_id: str):
-    """Remove a schedule from APScheduler."""
     job_id = f"schedule_{schedule_id}"
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
 
 
 # ------------------------------------------
-# App Lifecycle - start/stop scheduler
+# App Lifecycle
 # ------------------------------------------
 @app.on_event("startup")
 def startup_event():
@@ -562,34 +696,25 @@ def shutdown_event():
 
 
 # ------------------------------------------
-# POST /chat - returns immediately with job_id
+# POST /chat - Tier 2 sandbox for interactive coding tasks
 # ------------------------------------------
 @app.post("/chat/{session}")
 @app.post("/chat")
 def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     job_id = str(uuid.uuid4())
     create_job(job_id)
-
     thread = threading.Thread(
-        target=run_agent_in_background,
+        target=run_agent_in_sandbox,
         args=(job_id, prompt.prompt, prompt.repo, session),
-        kwargs={
-            "composio_mcp_url": prompt.composio_mcp_url,
-            "composio_api_key": prompt.composio_api_key,
-        },
+        kwargs={"composio_mcp_url": prompt.composio_mcp_url, "composio_api_key": prompt.composio_api_key},
         daemon=True,
     )
     thread.start()
-
-    return {
-        "job_id": job_id,
-        "status": "processing",
-        "message": "Agent started. Poll GET /result/{job_id} for status.",
-    }
+    return {"job_id": job_id, "status": "processing", "message": "Agent started. Poll GET /result/{job_id} for status."}
 
 
 # ------------------------------------------
-# GET /result/{job_id} - Poll for agent completion
+# GET /result/{job_id}
 # ------------------------------------------
 @app.get("/result/{job_id}")
 def get_result(job_id: str):
@@ -608,10 +733,10 @@ def get_result(job_id: str):
 
 
 # ------------------------------------------
-# POST /schedules - Create a new scheduled agent
+# Schedule CRUD
 # ------------------------------------------
 @app.post("/schedules")
-def create_schedule(body: ScheduleCreate):
+def create_schedule_endpoint(body: ScheduleCreate):
     result = db.table("schedules").insert({
         "name": body.name,
         "agent_prompt": body.agent_prompt,
@@ -621,28 +746,23 @@ def create_schedule(body: ScheduleCreate):
         "composio_entity_id": body.composio_entity_id,
         "composio_api_key": body.composio_api_key,
         "composio_mcp_url": body.composio_mcp_url,
+        "tier": body.tier or "api",
         "last_state": None,
         "last_run_at": None,
     }).execute()
-
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create schedule")
-
     schedule = result.data[0]
     _register_schedule(schedule)
-
     return {
         "id": schedule["id"],
         "name": schedule["name"],
         "cron_expression": schedule["cron_expression"],
         "enabled": schedule["enabled"],
-        "message": f"Schedule created and registered. Next run: {_next_run_time(schedule['id'])}",
+        "message": f"Schedule created. Next run: {_next_run_time(schedule['id'])}",
     }
 
 
-# ------------------------------------------
-# GET /schedules - List all schedules
-# ------------------------------------------
 @app.get("/schedules")
 def list_schedules():
     result = db.table("schedules").select("*").order("created_at", desc=True).execute()
@@ -652,70 +772,48 @@ def list_schedules():
     return {"schedules": schedules}
 
 
-# ------------------------------------------
-# GET /schedules/{schedule_id} - Single schedule + recent runs
-# ------------------------------------------
 @app.get("/schedules/{schedule_id}")
 def get_schedule_detail(schedule_id: str):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
-
     runs = (
-        db.table("agent_runs")
-        .select("*")
+        db.table("agent_runs").select("*")
         .eq("schedule_id", schedule_id)
-        .order("ran_at", desc=True)
-        .limit(10)
-        .execute()
+        .order("ran_at", desc=True).limit(10).execute()
     )
-
     schedule["next_run_at"] = _next_run_time(schedule_id)
     schedule["recent_runs"] = runs.data or []
     return schedule
 
 
-# ------------------------------------------
-# PATCH /schedules/{schedule_id} - Update a schedule
-# ------------------------------------------
 @app.patch("/schedules/{schedule_id}")
 def patch_schedule(schedule_id: str, body: ScheduleUpdate):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
-
     updates = {k: v for k, v in body.dict().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
-
     update_schedule(schedule_id, **updates)
-
     updated = get_schedule(schedule_id)
     if updated["enabled"]:
         _register_schedule(updated)
     else:
         _unregister_schedule(schedule_id)
-
     return {"id": schedule_id, "updated": updates, "next_run_at": _next_run_time(schedule_id)}
 
 
-# ------------------------------------------
-# DELETE /schedules/{schedule_id} - Delete a schedule
-# ------------------------------------------
 @app.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
-
     _unregister_schedule(schedule_id)
     db.table("schedules").delete().eq("id", schedule_id).execute()
     return {"id": schedule_id, "deleted": True}
 
 
-# ------------------------------------------
-# POST /schedules/{schedule_id}/run - Trigger manually right now
-# ------------------------------------------
 @app.post("/schedules/{schedule_id}/run")
 def trigger_schedule_now(schedule_id: str):
     schedule = get_schedule(schedule_id)
@@ -724,10 +822,8 @@ def trigger_schedule_now(schedule_id: str):
 
     job_id = str(uuid.uuid4())
     create_job(job_id, schedule_id=schedule_id)
-
     prompt_text = _build_scheduled_prompt(schedule)
 
-    # Refresh Composio MCP URL if credentials available
     composio_mcp_url = schedule.get("composio_mcp_url")
     composio_api_key = schedule.get("composio_api_key")
     composio_entity_id = schedule.get("composio_entity_id")
@@ -737,119 +833,90 @@ def trigger_schedule_now(schedule_id: str):
         if fresh_url:
             composio_mcp_url = fresh_url
 
-    thread = threading.Thread(
-        target=run_agent_in_background,
-        args=(job_id, prompt_text, None, None, schedule_id),
-        kwargs={
-            "composio_mcp_url": composio_mcp_url,
-            "composio_api_key": composio_api_key,
-        },
-        daemon=True,
-    )
-    thread.start()
+    # Route decision: use tier from schedule record, fall back to keyword detection
+    stored_tier = schedule.get("tier", "")
+    if stored_tier == "sandbox":
+        use_sandbox = True
+    elif stored_tier == "api":
+        use_sandbox = False
+    else:
+        use_sandbox = _needs_sandbox(schedule.get("agent_prompt", ""))
 
+    if use_sandbox:
+        print(f"[Manual] {schedule_id} -> Tier 2 (sandbox)")
+        thread = threading.Thread(
+            target=run_agent_in_sandbox,
+            args=(job_id, prompt_text, None, None, schedule_id),
+            kwargs={"composio_mcp_url": composio_mcp_url, "composio_api_key": composio_api_key},
+            daemon=True,
+        )
+    else:
+        print(f"[Manual] {schedule_id} -> Tier 1 (direct API)")
+        thread = threading.Thread(
+            target=run_tier1_agent,
+            args=(job_id, prompt_text, schedule_id),
+            kwargs={"composio_mcp_url": composio_mcp_url, "composio_api_key": composio_api_key},
+            daemon=True,
+        )
+    thread.start()
     return {
-        "job_id": job_id,
-        "schedule_id": schedule_id,
-        "status": "processing",
+        "job_id": job_id, "schedule_id": schedule_id,
+        "status": "processing", "tier": "sandbox" if use_sandbox else "api",
         "message": "Manual trigger fired. Poll GET /result/{job_id} for status.",
     }
 
 
-# ------------------------------------------
-# GET /schedules/{schedule_id}/state - View current agent state
-# ------------------------------------------
 @app.get("/schedules/{schedule_id}/state")
 def get_schedule_state(schedule_id: str):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    return {
-        "schedule_id": schedule_id,
-        "last_state": schedule.get("last_state") or {},
-        "last_run_at": schedule.get("last_run_at"),
-    }
+    return {"schedule_id": schedule_id, "last_state": schedule.get("last_state") or {}, "last_run_at": schedule.get("last_run_at")}
 
 
-# ------------------------------------------
-# DELETE /schedules/{schedule_id}/state - Reset agent state
-# ------------------------------------------
 @app.delete("/schedules/{schedule_id}/state")
 def reset_schedule_state(schedule_id: str):
     schedule = get_schedule(schedule_id)
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
     update_schedule(schedule_id, last_state=None)
-    return {"schedule_id": schedule_id, "last_state": None, "message": "State cleared. Next run will start fresh."}
+    return {"schedule_id": schedule_id, "last_state": None, "message": "State cleared."}
 
 
 # ------------------------------------------
-# GET /files/{sandbox_id} - List files in sandbox
+# File endpoints (sandbox only)
 # ------------------------------------------
 @app.get("/files/{sandbox_id}")
 def list_files(sandbox_id: str):
     sandbox = _get_sandbox(sandbox_id)
-
     result = sandbox.commands.run(
-        'find /home/user -type f '
-        '-not -path "*/\\.*" '
-        '-not -path "*/node_modules/*" '
-        '-not -path "*/__pycache__/*" '
-        '-not -name "*.pyc" '
-        '2>/dev/null | head -100',
+        'find /home/user -type f -not -path "*/\\.*" -not -path "*/node_modules/*" -not -path "*/__pycache__/*" -not -name "*.pyc" 2>/dev/null | head -100',
         timeout=30,
     )
-
     if not result.stdout or not result.stdout.strip():
         return {"sandbox_id": sandbox_id, "files": []}
-
     files = []
     for filepath in result.stdout.strip().split("\n"):
         filepath = filepath.strip()
         if not filepath:
             continue
-
         size_result = sandbox.commands.run(f'stat -c %s "{filepath}" 2>/dev/null', timeout=5)
         size = int(size_result.stdout.strip()) if size_result.stdout and size_result.stdout.strip().isdigit() else 0
-
         name = filepath.split("/")[-1]
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-
-        files.append(FileInfo(
-            path=filepath,
-            name=name,
-            size=size,
-            extension=ext,
-        ))
-
+        files.append(FileInfo(path=filepath, name=name, size=size, extension=ext))
     return {"sandbox_id": sandbox_id, "files": [f.dict() for f in files]}
 
 
-# ------------------------------------------
-# GET /files/{sandbox_id}/download - Single file as base64
-# ------------------------------------------
 @app.get("/files/{sandbox_id}/download")
 def download_file(sandbox_id: str, path: str):
     sandbox = _get_sandbox(sandbox_id)
-
-    result = sandbox.commands.run(
-        f'base64 -w 0 "{path}" 2>/dev/null',
-        timeout=30,
-    )
-
+    result = sandbox.commands.run(f'base64 -w 0 "{path}" 2>/dev/null', timeout=30)
     if not result.stdout or result.exit_code != 0:
-        raise HTTPException(status_code=404, detail=f"File not found or unreadable: {path}")
-
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
     name = path.split("/")[-1]
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-
-    return {
-        "path": path,
-        "name": name,
-        "extension": ext,
-        "content_base64": result.stdout.strip(),
-        "mime_type": _get_mime_type(ext),
-    }
+    return {"path": path, "name": name, "extension": ext, "content_base64": result.stdout.strip(), "mime_type": _get_mime_type(ext)}
 
 
 # ------------------------------------------
@@ -867,7 +934,6 @@ def _get_sandbox(sandbox_id: str) -> Sandbox:
 
 
 def _next_run_time(schedule_id: str) -> Optional[str]:
-    """Return the next scheduled run time as an ISO string, or None."""
     job = scheduler.get_job(f"schedule_{schedule_id}")
     if job and job.next_run_time:
         return job.next_run_time.isoformat()
@@ -876,35 +942,13 @@ def _next_run_time(schedule_id: str) -> Optional[str]:
 
 def _get_mime_type(ext: str) -> str:
     mime_map = {
-        "pdf": "application/pdf",
-        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "doc": "application/msword",
-        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "ppt": "application/vnd.ms-powerpoint",
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "xls": "application/vnd.ms-excel",
-        "csv": "text/csv",
-        "html": "text/html",
-        "htm": "text/html",
-        "css": "text/css",
-        "js": "application/javascript",
-        "ts": "application/typescript",
-        "jsx": "application/javascript",
-        "tsx": "application/typescript",
-        "json": "application/json",
-        "md": "text/markdown",
-        "txt": "text/plain",
-        "yaml": "text/yaml",
-        "yml": "text/yaml",
-        "py": "text/x-python",
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "gif": "image/gif",
-        "svg": "image/svg+xml",
-        "webp": "image/webp",
-        "zip": "application/zip",
-        "tar.gz": "application/gzip",
+        "pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc": "application/msword", "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "csv": "text/csv",
+        "html": "text/html", "css": "text/css", "js": "application/javascript", "ts": "application/typescript",
+        "json": "application/json", "md": "text/markdown", "txt": "text/plain", "py": "text/x-python",
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+        "svg": "image/svg+xml", "webp": "image/webp", "zip": "application/zip",
     }
     return mime_map.get(ext, "application/octet-stream")
 
@@ -914,5 +958,4 @@ def _get_mime_type(ext: str) -> str:
 # ------------------------------------------
 @app.get("/health")
 def health():
-    scheduled_jobs = len(scheduler.get_jobs())
-    return {"status": "ok", "scheduled_jobs": scheduled_jobs}
+    return {"status": "ok", "scheduled_jobs": len(scheduler.get_jobs())}
