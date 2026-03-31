@@ -106,7 +106,7 @@ OUTPUT RULES:
 - When you take screenshots during browser tasks, mention what you captured and why.
 - If a browser task fails, try an alternative approach before giving up.
 """
-sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "claude-code-dev")
+sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "world-modal-agent-browser")
 sandbox_timeout = 60 * 60  # 1 hour
 
 # Local cache of sandbox objects (runtime only, source of truth is Supabase)
@@ -471,7 +471,13 @@ def run_agent_in_sandbox(
                 "context7": {
                     "type": "http",
                     "url": "https://mcp.context7.com/mcp",
-                    "headers": {"Authorization": f"Bearer {sandbox_envs.get('CONTEXT7_API_KEY', '')}"}
+                    "headers": {
+                        "Authorization": f"Bearer {sandbox_envs.get('CONTEXT7_API_KEY', '')}"
+                    }
+                },
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest", "--headless"]
                 }
             }
         }
