@@ -497,7 +497,7 @@ def run_agent_in_sandbox(
             "--dangerously-skip-permissions",
             "--output-format", "json",
             "--model", "claude-sonnet-4-6",
-            "--append-system-prompt", shlex.quote(sandbox_system_prompt),
+            "--append-system-prompt", shlex.quote(system_prompt),
         ]
         if session:
             claude_args.append("--resume")
