@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from e2b import Sandbox
 from supabase import create_client, Client
+from mem0 import MemoryClient
 
 # ------------------------------------------
 # Startup Validation
@@ -38,6 +39,13 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Supabase Client
 # ------------------------------------------
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+MEM0_API_KEY = os.getenv("MEM0_API_KEY")
+mem0_client = MemoryClient(api_key=MEM0_API_KEY) if MEM0_API_KEY else None
+if mem0_client:
+    print("[Mem0] Memory layer initialized.")
+else:
+    print("[Mem0] No API key found. Running without persistent memory.")
 
 app = FastAPI()
 
@@ -251,6 +259,44 @@ def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Option
 
 
 # ------------------------------------------
+# Mem0 Persistent Memory
+# ------------------------------------------
+def recall_memories(user_id: str, query: str, limit: int = 5) -> str:
+    if not mem0_client or not user_id:
+        return ""
+    try:
+        results = mem0_client.search(query=query, user_id=user_id, limit=limit)
+        memories = results.get("results", []) if isinstance(results, dict) else results
+        if not memories:
+            return ""
+        memory_lines = []
+        for entry in memories:
+            mem_text = entry.get("memory", "") if isinstance(entry, dict) else str(entry)
+            if mem_text:
+                memory_lines.append(f"- {mem_text}")
+        return "\n".join(memory_lines) if memory_lines else ""
+    except Exception as e:
+        print(f"[Mem0] Recall failed for user {user_id}: {e}")
+        return ""
+
+
+def store_memories(user_id: str, user_message: str, assistant_message: str):
+    if not mem0_client or not user_id:
+        return
+    try:
+        mem0_client.add(
+            [
+                {"role": "user", "content": user_message[:2000]},
+                {"role": "assistant", "content": assistant_message[:2000]},
+            ],
+            user_id=user_id,
+        )
+        print(f"[Mem0] Stored memories for user {user_id}")
+    except Exception as e:
+        print(f"[Mem0] Store failed for user {user_id}: {e}")
+
+
+# ------------------------------------------
 # Composio MCP Session Refresh
 # ------------------------------------------
 def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
@@ -323,6 +369,18 @@ def run_tier1_agent(
 
         # Agent loop — Claude calls tools, API executes MCP tools server-side,
         # Claude sees results, decides next step, repeats until done
+        # Inject user memories if available
+        memories_str = recall_memories(schedule_id, prompt_text)
+        if memories_str:
+            prompt_text = f"""WHAT I KNOW ABOUT YOU (from previous interactions):
+{memories_str}
+
+Use this context naturally. Don't mention that you "remember" things — just apply the knowledge.
+
+---
+
+{prompt_text}"""
+
         messages = [{"role": "user", "content": prompt_text}]
         total_input_tokens = 0
         total_output_tokens = 0
@@ -421,6 +479,9 @@ def run_tier1_agent(
             summary=final_text[:2000] if final_text else None,
             result_type=result_type,
         )
+
+        # Store memories from this interaction
+        store_memories(schedule_id, prompt_text[:2000], final_text[:2000])
 
     except Exception as e:
         print(f"[Tier1] Error job {job_id}: {e}")
@@ -615,8 +676,16 @@ PREVIOUS RUN STATE (skip these items, only report NEW ones):
 {json.dumps(last_state, indent=2)}
 """
 
-    return f"""You are an autonomous agent running a scheduled task on the Clustor platform. Your output is displayed directly in a professional dashboard UI that renders markdown beautifully.
+    memories_str = recall_memories(schedule.get("composio_entity_id", schedule["id"]), base_prompt)
+    memory_block = ""
+    if memories_str:
+        memory_block = f"""
+USER CONTEXT (from previous interactions):
+{memories_str}
+"""
 
+    return f"""You are an autonomous agent running a scheduled task on the Clustor platform. Your output is displayed directly in a professional dashboard UI that renders markdown beautifully.
+{memory_block}
 TASK: {base_prompt}
 {state_block}
 OUTPUT RULES:
