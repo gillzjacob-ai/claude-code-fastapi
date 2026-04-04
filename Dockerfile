@@ -10,8 +10,7 @@ RUN pip install --no-cache-dir \
     "e2b==2.1.2" \
     "httpx>=0.27.0" \
     "supabase>=2.28.0" \
-    "apscheduler>=3.10.0" \
-    "mem0ai>=1.0.0"
+    "apscheduler>=3.10.0"
 
 # Copy application code
 COPY . .
