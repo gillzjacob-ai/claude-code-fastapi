@@ -17,7 +17,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from e2b import Sandbox
 from supabase import create_client, Client
-from mem0 import MemoryClient
 
 # ------------------------------------------
 # Startup Validation
@@ -42,13 +41,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Supabase Client
 # ------------------------------------------
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-MEM0_API_KEY = os.getenv("MEM0_API_KEY")
-mem0_client = MemoryClient(api_key=MEM0_API_KEY) if MEM0_API_KEY else None
-if mem0_client:
-    print("[Mem0] Memory layer initialized.")
-else:
-    print("[Mem0] No API key found. Running without persistent memory.")
 
 app = FastAPI()
 
@@ -173,6 +165,7 @@ class DurableExecuteRequest(BaseModel):
     prompt: str
     session_id: Optional[str] = None
     agent_id: Optional[str] = None
+    user_id: Optional[str] = None
     composio_mcp_url: Optional[str] = None
     composio_api_key: Optional[str] = None
     system_prompt: Optional[str] = None
@@ -298,42 +291,350 @@ def record_agent_run(schedule_id: str, job_id: str, status: str, summary: Option
     }).execute()
 
 
-# ------------------------------------------
-# Mem0 Persistent Memory
-# ------------------------------------------
-def recall_memories(user_id: str, query: str, limit: int = 5) -> str:
-    if not mem0_client or not user_id:
-        return ""
+# ===========================================================================
+# THREE-LAYER MEMORY SYSTEM
+# Replaces Mem0 with a Supabase-native memory system.
+# Layer 1: MEMORY.md — compact summary, always in context (~500-1500 tokens)
+# Layer 2: Topic files — detailed knowledge, loaded on demand
+# Layer 3: Freshness hints — confidence + timestamps on every topic
+# ===========================================================================
+
+# ── Layer 1: Load or create the user's MEMORY.md ──
+
+def _get_memory_profile(user_id: str) -> dict:
+    """Get the user's memory profile. Creates one if it doesn't exist."""
     try:
-        results = mem0_client.search(query=query, user_id=user_id, limit=limit)
-        memories = results.get("results", []) if isinstance(results, dict) else results
-        if not memories:
-            return ""
-        memory_lines = []
-        for entry in memories:
-            mem_text = entry.get("memory", "") if isinstance(entry, dict) else str(entry)
-            if mem_text:
-                memory_lines.append(f"- {mem_text}")
-        return "\n".join(memory_lines) if memory_lines else ""
+        result = db.table("memory_profiles").select("*").eq("user_id", user_id).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+        # Create a new profile
+        new_profile = {
+            "user_id": user_id,
+            "summary_md": "",
+            "facts": {},
+            "interaction_count": 0,
+        }
+        db.table("memory_profiles").insert(new_profile).execute()
+        return new_profile
     except Exception as e:
-        print(f"[Mem0] Recall failed for user {user_id}: {e}")
-        return ""
+        print(f"[Memory] Failed to get profile for {user_id}: {e}")
+        return {"user_id": user_id, "summary_md": "", "facts": {}, "interaction_count": 0}
 
 
-def store_memories(user_id: str, user_message: str, assistant_message: str):
-    if not mem0_client or not user_id:
-        return
+# ── Layer 2: Load topic files relevant to the current task ──
+
+TOPIC_RELEVANCE_MAP = {
+    # task keywords → memory topics to load
+    "email": ["contacts", "communication", "company"],
+    "pitch": ["company", "goals", "industry"],
+    "research": ["industry", "company", "projects"],
+    "write": ["writing_style", "communication", "company"],
+    "schedule": ["preferences", "contacts"],
+    "code": ["projects", "tools", "preferences"],
+    "analyze": ["industry", "company", "projects"],
+    "social": ["communication", "company", "goals"],
+    "report": ["company", "projects", "industry"],
+    "meeting": ["contacts", "company", "preferences"],
+    "strategy": ["company", "goals", "industry"],
+    "invest": ["industry", "goals", "contacts"],
+    "hire": ["company", "contacts", "goals"],
+    "design": ["preferences", "company", "projects"],
+    "market": ["company", "industry", "goals"],
+}
+
+
+def _identify_relevant_topics(task_prompt: str) -> list[str]:
+    """Determine which memory topics are relevant based on the task."""
+    prompt_lower = task_prompt.lower()
+    relevant = set()
+
+    for keyword, topics in TOPIC_RELEVANCE_MAP.items():
+        if keyword in prompt_lower:
+            relevant.update(topics)
+
+    # Always include "company" and "preferences" if we have any matches
+    if relevant:
+        relevant.add("preferences")
+
+    # If nothing matched, load the most general topics
+    if not relevant:
+        relevant = {"company", "preferences", "goals"}
+
+    return list(relevant)[:5]  # Cap at 5 topics to control token usage
+
+
+def _load_memory_topics(user_id: str, topics: list[str]) -> list[dict]:
+    """Load specific topic files for a user."""
+    if not topics:
+        return []
     try:
-        mem0_client.add(
-            [
-                {"role": "user", "content": user_message[:2000]},
-                {"role": "assistant", "content": assistant_message[:2000]},
-            ],
-            user_id=user_id,
+        result = (
+            db.table("memory_topics")
+            .select("topic, content, confidence, last_verified_at, source_count")
+            .eq("user_id", user_id)
+            .in_("topic", topics)
+            .execute()
         )
-        print(f"[Mem0] Stored memories for user {user_id}")
+        return result.data or []
     except Exception as e:
-        print(f"[Mem0] Store failed for user {user_id}: {e}")
+        print(f"[Memory] Failed to load topics for {user_id}: {e}")
+        return []
+
+
+# ── Main memory loader: builds the context string for agent prompts ──
+
+def load_memory_context(user_id: str, task_prompt: str) -> str:
+    """
+    Load the full memory context for an agent run.
+    Returns a formatted string to inject into the system prompt.
+    Layer 1 is always included. Layer 2 topics are selected by relevance.
+    Layer 3 freshness hints are inline.
+    """
+    if not user_id:
+        return ""
+
+    # Layer 1: Always load the profile summary
+    profile = _get_memory_profile(user_id)
+    summary_md = profile.get("summary_md", "").strip()
+
+    # Layer 2: Load relevant topics
+    relevant_topic_keys = _identify_relevant_topics(task_prompt)
+    topics = _load_memory_topics(user_id, relevant_topic_keys)
+
+    # Build the context string
+    parts = []
+
+    if summary_md:
+        parts.append(f"USER PROFILE (what you know about this user):\n{summary_md}")
+
+    if topics:
+        topic_parts = []
+        for t in topics:
+            content = t.get("content", "").strip()
+            if not content:
+                continue
+            confidence = t.get("confidence", 1.0)
+            topic_name = t.get("topic", "unknown").replace("_", " ").title()
+
+            # Layer 3: Add freshness hint if stale
+            hint = ""
+            last_verified = t.get("last_verified_at")
+            if last_verified:
+                try:
+                    verified_dt = datetime.fromisoformat(last_verified.replace("Z", "+00:00"))
+                    days_ago = (datetime.now(timezone.utc) - verified_dt).days
+                    if days_ago > 30:
+                        hint = f" [last confirmed {days_ago} days ago — may be outdated]"
+                    elif confidence < 0.5:
+                        hint = " [low confidence — verify before using]"
+                except Exception:
+                    pass
+
+            topic_parts.append(f"### {topic_name}{hint}\n{content}")
+
+        if topic_parts:
+            parts.append("DETAILED CONTEXT:\n" + "\n\n".join(topic_parts))
+
+    if not parts:
+        # No memory exists yet for this user — that's fine, it'll be created
+        # after their first interaction completes
+        return ""
+
+    context = "\n\n".join(parts)
+    # Add usage instruction
+    context += "\n\nUse this context naturally. Don't mention that you remember things — just apply the knowledge."
+
+    interaction_count = profile.get("interaction_count", 0)
+    print(f"[Memory] Loaded context for {user_id}: {len(summary_md)} chars profile, "
+          f"{len(topics)} topics, {interaction_count} prior interactions")
+
+    return context
+
+
+# ── Memory updater: extracts new knowledge after each agent run ──
+
+def update_memory(user_id: str, task_prompt: str, agent_output: str):
+    """
+    Update the three-layer memory after an agent completes.
+    Uses a cheap Claude call to extract new facts, then updates
+    the profile summary and relevant topic files.
+    """
+    if not user_id or not agent_output:
+        return
+
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            return
+
+        # Load current profile
+        profile = _get_memory_profile(user_id)
+        current_summary = profile.get("summary_md", "")
+        current_facts = profile.get("facts", {})
+        interaction_count = profile.get("interaction_count", 0)
+
+        # Ask Claude to extract new knowledge and update the summary
+        extraction_prompt = f"""You are a memory management system. Analyze this interaction and extract knowledge about the user.
+
+CURRENT USER PROFILE:
+{current_summary or "(no profile yet)"}
+
+CURRENT KNOWN FACTS:
+{json.dumps(current_facts) if current_facts else "(none)"}
+
+USER'S REQUEST:
+{task_prompt[:2000]}
+
+AGENT'S RESPONSE:
+{agent_output[:3000]}
+
+Respond with ONLY valid JSON (no markdown, no explanation) in this exact format:
+{{
+  "new_facts": {{
+    "name": "user's name if mentioned",
+    "company": "company name if mentioned",
+    "role": "their role if mentioned",
+    "industry": "their industry if mentioned",
+    "other_key": "any other important permanent facts"
+  }},
+  "updated_summary": "A concise 200-400 word markdown summary of everything known about this user. Include: who they are, what they do, their preferences, their current projects, and patterns you notice. Write in third person. Update the existing summary with new information — don't start from scratch unless the existing one is empty.",
+  "topics_to_update": [
+    {{
+      "topic": "topic_key",
+      "content": "Updated markdown content for this topic (200-500 words max)",
+      "facts": {{"key": "value"}}
+    }}
+  ]
+}}
+
+Rules:
+- Only include new_facts that were actually mentioned or strongly implied
+- Remove null/empty values from new_facts
+- For updated_summary, MERGE new info with existing — don't lose old facts
+- For topics_to_update, use topic keys like: company, contacts, preferences, projects, writing_style, industry, tools, goals, communication
+- Only include topics where you learned something new
+- Keep everything concise — this is a memory system, not a report"""
+
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": extraction_prompt}],
+            },
+            timeout=30,
+        )
+
+        if not resp.is_success:
+            print(f"[Memory] Extraction API failed: {resp.status_code}")
+            return
+
+        result = resp.json()
+        raw_text = "\n".join(
+            b.get("text", "") for b in result.get("content", [])
+            if b.get("type") == "text"
+        ).strip()
+
+        # Parse the JSON response
+        # Strip markdown code fences if present
+        clean_text = raw_text
+        if clean_text.startswith("```"):
+            clean_text = re.sub(r'^```(?:json)?\s*', '', clean_text)
+            clean_text = re.sub(r'\s*```$', '', clean_text)
+
+        try:
+            extracted = json.loads(clean_text)
+        except json.JSONDecodeError:
+            print(f"[Memory] Failed to parse extraction response: {raw_text[:200]}")
+            return
+
+        # ── Update Layer 1: Profile summary ──
+        new_facts = extracted.get("new_facts", {})
+        # Remove empty values
+        new_facts = {k: v for k, v in new_facts.items() if v and v.strip()}
+        merged_facts = {**current_facts, **new_facts}
+
+        updated_summary = extracted.get("updated_summary", current_summary)
+        if not updated_summary or len(updated_summary) < 20:
+            updated_summary = current_summary
+
+        try:
+            db.table("memory_profiles").upsert({
+                "user_id": user_id,
+                "summary_md": updated_summary[:5000],
+                "facts": merged_facts,
+                "interaction_count": interaction_count + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
+            print(f"[Memory] Updated profile for {user_id}: "
+                  f"{len(updated_summary)} chars, {len(merged_facts)} facts")
+        except Exception as e:
+            print(f"[Memory] Failed to update profile: {e}")
+
+        # ── Update Layer 2+3: Topic files ──
+        topics_to_update = extracted.get("topics_to_update", [])
+        for topic_data in topics_to_update:
+            topic_key = topic_data.get("topic", "").strip().lower().replace(" ", "_")
+            topic_content = topic_data.get("content", "").strip()
+            topic_facts = topic_data.get("facts", {})
+
+            if not topic_key or not topic_content:
+                continue
+
+            try:
+                db.table("memory_topics").upsert({
+                    "user_id": user_id,
+                    "topic": topic_key,
+                    "content": topic_content[:5000],
+                    "facts": topic_facts if isinstance(topic_facts, dict) else {},
+                    "confidence": 1.0,
+                    "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                    "source_count": 1,  # Will increment on conflict via trigger or next update
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }, on_conflict="user_id,topic").execute()
+            except Exception as e:
+                print(f"[Memory] Failed to update topic {topic_key}: {e}")
+
+        if topics_to_update:
+            print(f"[Memory] Updated {len(topics_to_update)} topics for {user_id}: "
+                  f"{', '.join(t.get('topic', '?') for t in topics_to_update)}")
+
+    except Exception as e:
+        print(f"[Memory] Update failed for {user_id}: {e}")
+
+
+# ── Memory API endpoint for the frontend memory panel ──
+# (Will be wired up as an endpoint below)
+
+def get_user_memory_summary(user_id: str) -> dict:
+    """Get the full memory state for a user (for the memory panel UI)."""
+    profile = _get_memory_profile(user_id)
+    try:
+        topics_result = (
+            db.table("memory_topics")
+            .select("topic, content, confidence, last_verified_at, source_count, updated_at")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        topics = topics_result.data or []
+    except Exception:
+        topics = []
+
+    return {
+        "user_id": user_id,
+        "profile": {
+            "summary": profile.get("summary_md", ""),
+            "facts": profile.get("facts", {}),
+            "interaction_count": profile.get("interaction_count", 0),
+        },
+        "topics": topics,
+    }
 
 
 # ------------------------------------------
@@ -542,7 +843,7 @@ def _autocompact_messages(messages: list, accumulated_output: str, api_key: str)
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 800,
                 "messages": [{"role": "user", "content": (
                     f"Summarize this agent's work in under 400 words. "
@@ -602,6 +903,7 @@ def run_tier1_durable(
     session_id: str = None,
     agent_id: str = None,
     schedule_id: str = None,
+    user_id: str = None,
     composio_mcp_url: str = None,
     composio_api_key: str = None,
     system_prompt_override: str = None,
@@ -609,6 +911,25 @@ def run_tier1_durable(
     try:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         use_prompt = system_prompt_override or TIER1_INTERACTIVE_SYSTEM_PROMPT
+
+        # ── Resolve user_id for memory (fallback chain) ──
+        # ── Resolve user_id for memory ──
+        # IMPORTANT: This must be the Supabase auth user_id, not a session_id.
+        # The Edge Function should pass the real user_id from the session.
+        # For scheduled tasks, composio_entity_id is the user_id.
+        # We NEVER fall back to session_id — that would scatter memories
+        # across sessions instead of aggregating per user.
+        memory_user_id = user_id or schedule_id or None
+
+        # ── Inject memory context into prompt (Layer 1 always, Layer 2 on demand) ──
+        if memory_user_id and prompt_text:
+            memory_context = load_memory_context(memory_user_id, prompt_text)
+            if memory_context:
+                prompt_text = f"""{memory_context}
+
+---
+
+{prompt_text}"""
 
         # ── Resume from checkpoint if available ──
         checkpoint = _load_latest_checkpoint(job_id)
@@ -815,6 +1136,13 @@ def run_tier1_durable(
 
         update_job(job_id, status="complete", result=result_payload)
 
+        # ── Update three-layer memory (fire-and-forget) ──
+        if memory_user_id and accumulated_output:
+            try:
+                update_memory(memory_user_id, prompt_text[:2000], accumulated_output[:3000])
+            except Exception as mem_err:
+                print(f"[Tier1-Durable] Memory update failed (non-fatal): {mem_err}")
+
         if schedule_id:
             new_state = _extract_agent_state(accumulated_output)
             if new_state:
@@ -824,7 +1152,6 @@ def run_tier1_durable(
                 summary=accumulated_output[:2000] if accumulated_output else None,
                 result_type=_extract_result_type(accumulated_output),
             )
-            store_memories(schedule_id, prompt_text[:2000], accumulated_output[:2000])
 
     except Exception as e:
         print(f"[Tier1-Durable] Error job {job_id}: {e}")
@@ -877,12 +1204,10 @@ def run_tier1_agent(
 
         print(f"[Tier1] Starting agent for schedule {schedule_id}, job {job_id}, mcp={bool(composio_mcp_url)}")
 
-        memories_str = recall_memories(schedule_id, prompt_text)
-        if memories_str:
-            prompt_text = f"""WHAT I KNOW ABOUT YOU (from previous interactions):
-{memories_str}
-
-Use this context naturally. Don't mention that you "remember" things — just apply the knowledge.
+        # Inject three-layer memory context
+        memory_context = load_memory_context(schedule_id, prompt_text)
+        if memory_context:
+            prompt_text = f"""{memory_context}
 
 ---
 
@@ -983,7 +1308,12 @@ Use this context naturally. Don't mention that you "remember" things — just ap
             result_type=result_type,
         )
 
-        store_memories(schedule_id, prompt_text[:2000], final_text[:2000])
+        # Update three-layer memory
+        if schedule_id and final_text:
+            try:
+                update_memory(schedule_id, prompt_text[:2000], final_text[:3000])
+            except Exception as mem_err:
+                print(f"[Tier1] Memory update failed (non-fatal): {mem_err}")
 
     except Exception as e:
         print(f"[Tier1] Error job {job_id}: {e}")
@@ -1173,11 +1503,10 @@ PREVIOUS RUN STATE (skip these items, only report NEW ones):
 {json.dumps(last_state, indent=2)}
 """
 
-    memories_str = recall_memories(schedule.get("composio_entity_id", schedule["id"]), base_prompt)
+    memories_str = load_memory_context(schedule.get("composio_entity_id", schedule["id"]), base_prompt)
     memory_block = ""
     if memories_str:
         memory_block = f"""
-USER CONTEXT (from previous interactions):
 {memories_str}
 """
 
@@ -1390,6 +1719,7 @@ def execute_durable(body: DurableExecuteRequest):
             "prompt_text": body.prompt,
             "session_id": body.session_id,
             "agent_id": body.agent_id,
+            "user_id": body.user_id,
             "composio_mcp_url": body.composio_mcp_url,
             "composio_api_key": body.composio_api_key,
             "system_prompt_override": body.system_prompt,
@@ -1517,6 +1847,43 @@ def resume_incomplete_jobs():
             print(f"[Resume] Resumed job {jid}")
 
         return {"resumed": resumed, "total_incomplete": len(jobs)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ===========================================================================
+# MEMORY API ENDPOINTS
+# ===========================================================================
+
+# ------------------------------------------
+# GET /memory/{user_id} — Get full memory state
+# ------------------------------------------
+@app.get("/memory/{user_id}")
+def get_memory(user_id: str):
+    return get_user_memory_summary(user_id)
+
+
+# ------------------------------------------
+# DELETE /memory/{user_id} — Clear all memory for a user
+# ------------------------------------------
+@app.delete("/memory/{user_id}")
+def clear_memory(user_id: str):
+    try:
+        db.table("memory_profiles").delete().eq("user_id", user_id).execute()
+        db.table("memory_topics").delete().eq("user_id", user_id).execute()
+        return {"user_id": user_id, "cleared": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ------------------------------------------
+# DELETE /memory/{user_id}/topic/{topic} — Delete a specific topic
+# ------------------------------------------
+@app.delete("/memory/{user_id}/topic/{topic}")
+def clear_memory_topic(user_id: str, topic: str):
+    try:
+        db.table("memory_topics").delete().eq("user_id", user_id).eq("topic", topic).execute()
+        return {"user_id": user_id, "topic": topic, "cleared": True}
     except Exception as e:
         return {"error": str(e)}
 
