@@ -445,6 +445,131 @@ def _call_anthropic_with_retry(headers: dict, body: dict, max_retries: int = 3):
     return None
 
 
+# ------------------------------------------
+# Context Compaction — Three-Tier System
+# Prevents context window overflow on long-running agents.
+# ------------------------------------------
+
+def _estimate_tokens(messages: list) -> int:
+    """Rough token estimate for a messages array (~4 chars per token)."""
+    total_chars = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+                    total_chars += len(block.get("content", "")) if isinstance(block.get("content"), str) else 0
+                    total_chars += len(json.dumps(block.get("input", {}))) if block.get("input") else 0
+    return total_chars // 4
+
+
+AUTOCOMPACT_THRESHOLD = 80000  # ~80K tokens triggers auto-compaction
+
+
+def _compact_tool_results(messages: list) -> list:
+    """Tier 1: Strip bloated tool results down to essentials after each iteration."""
+    compacted = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if msg.get("role") == "user" and isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    rc = block.get("content", "")
+                    if isinstance(rc, str) and len(rc) > 3000:
+                        new_blocks.append({**block, "content": rc[:2000] + f"\n...[compressed: {len(rc)} chars total]...\n" + rc[-500:]})
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            compacted.append({**msg, "content": new_blocks})
+        elif msg.get("role") == "assistant" and isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("tool_use", "mcp_tool_use"):
+                    ti = block.get("input", {})
+                    if isinstance(ti, dict) and len(json.dumps(ti)) > 2000:
+                        compressed = {k: (v[:500] + "...[truncated]" if isinstance(v, str) and len(v) > 500 else v) for k, v in ti.items()}
+                        new_blocks.append({**block, "input": compressed})
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            compacted.append({**msg, "content": new_blocks})
+        else:
+            compacted.append(msg)
+    return compacted
+
+
+def _autocompact_messages(messages: list, accumulated_output: str, api_key: str) -> list:
+    """Tier 2: When messages exceed 80K tokens, summarize and restart with compact context."""
+    print(f"[AutoCompact] Triggered — ~{_estimate_tokens(messages)} tokens, {len(messages)} messages")
+
+    tool_calls = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("tool_use", "mcp_tool_use"):
+                    tool_calls.append(block.get("name", "unknown"))
+
+    # Find the original user prompt
+    original_prompt = ""
+    for msg in messages:
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            original_prompt = msg["content"]
+            break
+
+    # Try to get a summary from Claude (cheap, fast call)
+    summary = f"Made {len(tool_calls)} tool calls ({', '.join(set(tool_calls[:10]))}). Output: {len(accumulated_output)} chars."
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": (
+                    f"Summarize this agent's work in under 400 words. "
+                    f"Tools called: {', '.join(tool_calls[:20])}. "
+                    f"Output so far ({len(accumulated_output)} chars): "
+                    f"{accumulated_output[:3000]}"
+                )}],
+            },
+            timeout=30,
+        )
+        if resp.is_success:
+            summary = "\n".join(
+                b.get("text", "") for b in resp.json().get("content", [])
+                if b.get("type") == "text"
+            ) or summary
+    except Exception as e:
+        print(f"[AutoCompact] Summary failed: {e}")
+
+    # Rebuild messages with compact context
+    new_messages = [{
+        "role": "user",
+        "content": (
+            f"CONTEXT RECOVERY (compacted to save tokens):\n\n"
+            f"ORIGINAL TASK:\n{original_prompt[:2000]}\n\n"
+            f"PROGRESS:\n{summary}\n\n"
+            f"CURRENT OUTPUT (continue from here):\n"
+            f"{accumulated_output[-4000:] if len(accumulated_output) > 4000 else accumulated_output}\n\n"
+            f"Continue. Do not restart."
+        ),
+    }]
+
+    print(f"[AutoCompact] Compacted to ~{_estimate_tokens(new_messages)} tokens")
+    return new_messages
+
+
 def _safe_truncate_input(tool_input, max_len: int = 2000) -> dict:
     """Truncate large tool input values for DB storage."""
     if not isinstance(tool_input, dict):
@@ -619,10 +744,15 @@ def run_tier1_durable(
                                iteration=iteration)
 
                 messages.append({"role": "user", "content": tool_results})
+                messages = _compact_tool_results(messages)
                 print(f"[Tier1-Durable] Iteration {iteration + 1}: "
                       f"{len(tool_blocks)} tool calls")
             else:
                 break
+
+            # ── Auto-compact if context is getting too large ──
+            if _estimate_tokens(messages) > AUTOCOMPACT_THRESHOLD:
+                messages = _autocompact_messages(messages, accumulated_output, os.getenv("ANTHROPIC_API_KEY"))
 
             # ── CHECKPOINT — save full state for crash recovery ──
             step_counter += 1
@@ -631,7 +761,8 @@ def run_tier1_durable(
                        accumulated_output=accumulated_output,
                        iteration=iteration,
                        token_count_in=total_input_tokens,
-                       token_count_out=total_output_tokens)
+                       token_count_out=total_output_tokens,
+                       token_text=f"Checkpoint: {len(messages)} msgs, ~{_estimate_tokens(messages)} tokens, {len(accumulated_output)} chars output")
 
             step_counter += 1
             _emit_step(job_id, session_id, agent_id, step_counter, "state",
