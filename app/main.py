@@ -337,29 +337,37 @@ def store_memories(user_id: str, user_message: str, assistant_message: str):
 
 
 # ------------------------------------------
-# Composio MCP Session Refresh
+# Composio MCP Session Refresh (with retry)
+# MCP URLs expire. This must be called before every execution
+# that uses Composio tools — scheduled, interactive, or manual.
 # ------------------------------------------
-def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
-    try:
-        resp = httpx.post(
-            "https://backend.composio.dev/api/v3/tool_router/session",
-            headers={
-                "x-api-key": api_key,
-                "Content-Type": "application/json",
-            },
-            json={"user_id": entity_id},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        url = data.get("mcp", {}).get("url", "")
-        if url:
-            print(f"[Composio] Refreshed MCP URL for entity {entity_id}")
-            return url
-        return None
-    except Exception as e:
-        print(f"[Composio] MCP refresh failed for entity {entity_id}: {e}")
-        return None
+def refresh_composio_mcp_url(entity_id: str, api_key: str, max_retries: int = 3) -> Optional[str]:
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.post(
+                "https://backend.composio.dev/api/v3/tool_router/session",
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"user_id": entity_id},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            url = data.get("mcp", {}).get("url", "")
+            if url:
+                print(f"[Composio] Refreshed MCP URL for entity {entity_id}")
+                return url
+            print(f"[Composio] Empty URL in response for entity {entity_id}")
+            return None
+        except Exception as e:
+            wait = (2 ** attempt) + 1
+            print(f"[Composio] MCP refresh attempt {attempt + 1}/{max_retries} failed for {entity_id}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+    print(f"[Composio] MCP refresh exhausted all retries for entity {entity_id}")
+    return None
 
 
 # ===========================================================================
@@ -623,6 +631,18 @@ def run_tier1_durable(
             _emit_step(job_id, session_id, agent_id, 1, "state", state="working")
 
         # ── Build request ──
+        # Refresh Composio MCP URL if we have credentials (URLs expire)
+        if composio_mcp_url and composio_api_key:
+            # Try to extract entity_id from the URL or use a fallback
+            # The entity_id is typically the user_id passed when creating the session
+            fresh_url = refresh_composio_mcp_url(
+                session_id or agent_id or "default",
+                composio_api_key,
+            )
+            if fresh_url:
+                composio_mcp_url = fresh_url
+                print(f"[Tier1-Durable] Refreshed Composio MCP URL for job {job_id}")
+
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
