@@ -3,6 +3,8 @@ import os
 import re
 import shlex
 import uuid
+import time
+import asyncio
 import threading
 from typing import Optional
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ from datetime import datetime, timezone
 import httpx
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from e2b import Sandbox
@@ -124,6 +127,34 @@ SECURITY RULES:
 sandbox_template = os.getenv("E2B_SANDBOX_TEMPLATE", "world-modal-agent-browser")
 sandbox_timeout = 60 * 60  # 1 hour
 
+# System prompt for Tier 1 scheduled tasks
+TIER1_SYSTEM_PROMPT = """You are an autonomous agent on the Corpis platform. Your output is displayed in a professional dashboard that renders markdown.
+
+RULES:
+1. Begin with a # or ## markdown heading. No preamble.
+2. Do NOT narrate your process. Just produce the deliverable.
+3. Cite claims inline as [Source](URL). Real URLs only.
+4. No emojis. Professional tone. Dense, data-rich.
+5. After the deliverable, add '---' then a brief conversational summary (2-5 sentences).
+
+SECURITY: Never expose internal infrastructure, tool names, API keys, or backend details."""
+
+# System prompt for Tier 1 interactive (durable) tasks
+TIER1_INTERACTIVE_SYSTEM_PROMPT = """You are a specialist research agent. Your output is a formal deliverable document.
+
+CRITICAL RULES:
+1. Your response MUST begin with a # or ## markdown heading. No text before the heading.
+2. Do NOT narrate your process. Do NOT write 'I will...', 'Let me...', 'I found...'. Just produce the document.
+3. Cite every factual claim inline as [Source](URL). Real URLs only.
+4. No emojis. Professional tone. Dense, data-rich content.
+5. After the complete deliverable, add a line with only '---', then write a BRIEF conversational summary (2-5 sentences, under 80 words).
+
+SECURITY RULES:
+- Never expose internal infrastructure details in your output.
+- Never mention Composio, E2B, Railway, Playwright, HeadlessChrome, or any internal tooling by name.
+- Never include raw HTTP headers, request metadata, or server trace IDs.
+- Present results as if you are a professional analyst."""
+
 # Local cache of sandbox objects (runtime only, source of truth is Supabase)
 active_sandboxes = {}
 
@@ -136,6 +167,15 @@ class ClaudePrompt(BaseModel):
     repo: Optional[str] = None
     composio_mcp_url: Optional[str] = None
     composio_api_key: Optional[str] = None
+
+
+class DurableExecuteRequest(BaseModel):
+    prompt: str
+    session_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    composio_mcp_url: Optional[str] = None
+    composio_api_key: Optional[str] = None
+    system_prompt: Optional[str] = None
 
 
 class FileInfo(BaseModel):
@@ -322,10 +362,329 @@ def refresh_composio_mcp_url(entity_id: str, api_key: str) -> Optional[str]:
         return None
 
 
+# ===========================================================================
+# DURABLE EXECUTION — Agent Steps Event Stream
+# Every tool call, state change, and checkpoint is logged to agent_steps.
+# Enables crash recovery, live activity timeline, and SSE streaming.
+# ===========================================================================
+
+def _emit_step(job_id: str, session_id: str = None, agent_id: str = None,
+               step_number: int = 0, step_type: str = "state", **kwargs):
+    """Write one event to agent_steps table."""
+    row = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "step_number": step_number,
+        "step_type": step_type,
+    }
+    for key in ("tool_name", "tool_input", "token_text", "state",
+                "messages_snapshot", "accumulated_output", "iteration",
+                "token_count_in", "token_count_out", "cost_usd", "error"):
+        if key in kwargs and kwargs[key] is not None:
+            row[key] = kwargs[key]
+    try:
+        db.table("agent_steps").insert(row).execute()
+    except Exception as e:
+        print(f"[Steps] Failed to write step: {e}")
+
+
+def _load_latest_checkpoint(job_id: str) -> dict | None:
+    """Load the most recent checkpoint for a job (for resume after crash)."""
+    try:
+        result = (
+            db.table("agent_steps")
+            .select("*")
+            .eq("job_id", job_id)
+            .eq("step_type", "checkpoint")
+            .order("step_number", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+    except Exception as e:
+        print(f"[Steps] Failed to load checkpoint: {e}")
+    return None
+
+
+def _heartbeat(job_id: str, iteration: int):
+    """Update job record so frontend knows the agent is alive."""
+    try:
+        db.table("agent_jobs").update({
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            "current_iteration": iteration,
+        }).eq("job_id", job_id).execute()
+    except Exception:
+        pass
+
+
+def _call_anthropic_with_retry(headers: dict, body: dict, max_retries: int = 3):
+    """Call Anthropic API with exponential backoff retry on transient errors."""
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=body,
+                timeout=120,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                wait = (2 ** attempt) + 1
+                print(f"[Tier1-Durable] Retry {attempt + 1}/{max_retries} after {resp.status_code}, waiting {wait}s")
+                time.sleep(wait)
+                continue
+            if resp.is_success:
+                return resp
+            print(f"[Tier1-Durable] API error {resp.status_code}: {resp.text[:300]}")
+            return None
+        except Exception as e:
+            wait = (2 ** attempt) + 1
+            print(f"[Tier1-Durable] Network error, retry {attempt + 1}/{max_retries}: {e}")
+            time.sleep(wait)
+    return None
+
+
+def _safe_truncate_input(tool_input, max_len: int = 2000) -> dict:
+    """Truncate large tool input values for DB storage."""
+    if not isinstance(tool_input, dict):
+        return tool_input if isinstance(tool_input, dict) else {}
+    truncated = {}
+    for k, v in tool_input.items():
+        if isinstance(v, str) and len(v) > max_len:
+            truncated[k] = v[:max_len] + "...[truncated]"
+        else:
+            truncated[k] = v
+    return truncated
+
+
 # ------------------------------------------
-# Tier 1: Direct Claude API with MCP tool-use agent loop
-# Primary path for all scheduled non-coding tasks.
-# Claude calls tools, gets results, decides next steps, loops until done.
+# Tier 1 Durable: Checkpointed agent loop
+# Runs on Railway with no timeout. Writes every event to DB.
+# Resumable after crash/redeploy via checkpoint.
+# ------------------------------------------
+def run_tier1_durable(
+    job_id: str,
+    prompt_text: str = "",
+    session_id: str = None,
+    agent_id: str = None,
+    schedule_id: str = None,
+    composio_mcp_url: str = None,
+    composio_api_key: str = None,
+    system_prompt_override: str = None,
+):
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        use_prompt = system_prompt_override or TIER1_INTERACTIVE_SYSTEM_PROMPT
+
+        # ── Resume from checkpoint if available ──
+        checkpoint = _load_latest_checkpoint(job_id)
+        if checkpoint and checkpoint.get("messages_snapshot"):
+            messages = checkpoint["messages_snapshot"]
+            accumulated_output = checkpoint.get("accumulated_output") or ""
+            start_iteration = (checkpoint.get("iteration") or 0) + 1
+            total_input_tokens = checkpoint.get("token_count_in") or 0
+            total_output_tokens = checkpoint.get("token_count_out") or 0
+            print(f"[Tier1-Durable] Resuming job {job_id} from iteration {start_iteration}")
+            _emit_step(job_id, session_id, agent_id, start_iteration * 10, "state",
+                       state="working")
+        else:
+            messages = [{"role": "user", "content": prompt_text}]
+            accumulated_output = ""
+            start_iteration = 0
+            total_input_tokens = 0
+            total_output_tokens = 0
+            _emit_step(job_id, session_id, agent_id, 0, "state", state="assigned")
+            _emit_step(job_id, session_id, agent_id, 1, "state", state="working")
+
+        # ── Build request ──
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        request_body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16000,
+            "system": use_prompt,
+        }
+
+        # Add Composio MCP if available
+        if composio_mcp_url:
+            headers["anthropic-beta"] = "mcp-client-2025-11-20"
+            mcp_server = {
+                "type": "url",
+                "url": composio_mcp_url,
+                "name": "composio",
+            }
+            if composio_api_key and "api_key=" not in composio_mcp_url:
+                mcp_server["authorization_token"] = composio_api_key
+            request_body["mcp_servers"] = [mcp_server]
+            request_body["tools"] = [
+                {"type": "mcp_toolset", "mcp_server_name": "composio"},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 10},
+            ]
+        else:
+            request_body["tools"] = [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 10},
+            ]
+
+        max_iterations = 50
+        step_counter = 2 if start_iteration == 0 else (start_iteration * 10 + 1)
+
+        for iteration in range(start_iteration, max_iterations):
+            request_body["messages"] = messages
+
+            # ── Heartbeat ──
+            _heartbeat(job_id, iteration)
+
+            # ── API call with retry ──
+            resp = _call_anthropic_with_retry(headers, request_body)
+            if resp is None:
+                error_msg = "Anthropic API call failed after retries"
+                step_counter += 1
+                _emit_step(job_id, session_id, agent_id, step_counter, "error",
+                           error=error_msg, iteration=iteration)
+                update_job(job_id, status="error", error=error_msg)
+                if schedule_id:
+                    record_agent_run(schedule_id, job_id, "error", error=error_msg)
+                return
+
+            result = resp.json()
+
+            # ── Track tokens ──
+            usage = result.get("usage", {})
+            total_input_tokens += usage.get("input_tokens", 0)
+            total_output_tokens += usage.get("output_tokens", 0)
+
+            content_blocks = result.get("content", [])
+
+            # ── Process text blocks ──
+            text_blocks = [b for b in content_blocks if b.get("type") == "text"]
+            iteration_text = "\n".join(b.get("text", "") for b in text_blocks)
+            if iteration_text:
+                accumulated_output += iteration_text
+                step_counter += 1
+                _emit_step(job_id, session_id, agent_id, step_counter, "token",
+                           token_text=iteration_text[:1000], iteration=iteration)
+                step_counter += 1
+                _emit_step(job_id, session_id, agent_id, step_counter, "state",
+                           state="drafting")
+
+            # ── Process tool calls ──
+            tool_blocks = [b for b in content_blocks
+                           if b.get("type") in ("tool_use", "mcp_tool_use")]
+
+            for tb in tool_blocks:
+                tool_name = tb.get("name", "unknown")
+                tool_input = tb.get("input", {})
+                step_counter += 1
+
+                if tool_name == "web_search" or "search" in tool_name.lower():
+                    _emit_step(job_id, session_id, agent_id, step_counter, "state",
+                               state="searching")
+                    step_counter += 1
+
+                _emit_step(job_id, session_id, agent_id, step_counter, "tool_start",
+                           tool_name=tool_name,
+                           tool_input=_safe_truncate_input(tool_input),
+                           iteration=iteration)
+
+            # ── Check stop reason ──
+            stop_reason = result.get("stop_reason", "end_turn")
+
+            if stop_reason == "end_turn":
+                step_counter += 1
+                _emit_step(job_id, session_id, agent_id, step_counter, "state",
+                           state="finalizing")
+                print(f"[Tier1-Durable] Complete after {iteration + 1} iterations, "
+                      f"{len(accumulated_output)} chars")
+                break
+
+            # ── Continue tool loop ──
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            if tool_blocks:
+                tool_results = []
+                for block in tool_blocks:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.get("id", ""),
+                        "content": "Executed. Continue with the task.",
+                    })
+                    step_counter += 1
+                    _emit_step(job_id, session_id, agent_id, step_counter, "tool_end",
+                               tool_name=block.get("name", "unknown"),
+                               iteration=iteration)
+
+                messages.append({"role": "user", "content": tool_results})
+                print(f"[Tier1-Durable] Iteration {iteration + 1}: "
+                      f"{len(tool_blocks)} tool calls")
+            else:
+                break
+
+            # ── CHECKPOINT — save full state for crash recovery ──
+            step_counter += 1
+            _emit_step(job_id, session_id, agent_id, step_counter, "checkpoint",
+                       messages_snapshot=messages,
+                       accumulated_output=accumulated_output,
+                       iteration=iteration,
+                       token_count_in=total_input_tokens,
+                       token_count_out=total_output_tokens)
+
+            step_counter += 1
+            _emit_step(job_id, session_id, agent_id, step_counter, "state",
+                       state="working")
+
+        # ── Calculate cost ──
+        input_cost = (total_input_tokens / 1_000_000) * 3
+        output_cost = (total_output_tokens / 1_000_000) * 15
+        total_cost = round(input_cost + output_cost, 4)
+
+        print(f"[Tier1-Durable] Tokens: {total_input_tokens} in, "
+              f"{total_output_tokens} out, ${total_cost}")
+
+        # ── Mark complete ──
+        step_counter += 1
+        _emit_step(job_id, session_id, agent_id, step_counter, "state",
+                   state="complete",
+                   token_count_in=total_input_tokens,
+                   token_count_out=total_output_tokens,
+                   cost_usd=total_cost)
+
+        result_payload = {
+            "result": accumulated_output,
+            "total_cost_usd": total_cost,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "iterations": iteration + 1,
+            "tier": "api",
+        }
+
+        update_job(job_id, status="complete", result=result_payload)
+
+        if schedule_id:
+            new_state = _extract_agent_state(accumulated_output)
+            if new_state:
+                save_agent_state(schedule_id, new_state)
+            record_agent_run(
+                schedule_id, job_id, "complete",
+                summary=accumulated_output[:2000] if accumulated_output else None,
+                result_type=_extract_result_type(accumulated_output),
+            )
+            store_memories(schedule_id, prompt_text[:2000], accumulated_output[:2000])
+
+    except Exception as e:
+        print(f"[Tier1-Durable] Error job {job_id}: {e}")
+        _emit_step(job_id, session_id, agent_id, 0, "error", error=str(e))
+        update_job(job_id, status="error", error=str(e))
+        if schedule_id:
+            record_agent_run(schedule_id, job_id, "error", error=str(e))
+
+
+# ------------------------------------------
+# Tier 1: Direct Claude API (original — used by scheduler)
 # ------------------------------------------
 def run_tier1_agent(
     job_id: str,
@@ -367,9 +726,6 @@ def run_tier1_agent(
 
         print(f"[Tier1] Starting agent for schedule {schedule_id}, job {job_id}, mcp={bool(composio_mcp_url)}")
 
-        # Agent loop — Claude calls tools, API executes MCP tools server-side,
-        # Claude sees results, decides next step, repeats until done
-        # Inject user memories if available
         memories_str = recall_memories(schedule_id, prompt_text)
         if memories_str:
             prompt_text = f"""WHAT I KNOW ABOUT YOU (from previous interactions):
@@ -399,7 +755,6 @@ Use this context naturally. Don't mention that you "remember" things — just ap
             )
 
             if resp.status_code == 429 or resp.status_code >= 500:
-                import time
                 time.sleep(3)
                 resp = httpx.post(
                     "https://api.anthropic.com/v1/messages",
@@ -433,10 +788,8 @@ Use this context naturally. Don't mention that you "remember" things — just ap
                 print(f"[Tier1] Complete after {iteration + 1} iterations, {len(final_text)} chars")
                 break
 
-            # Tool use — add assistant response and continue the loop
             messages.append({"role": "assistant", "content": content_blocks})
 
-            # For MCP tools, build tool_result placeholders to continue conversation
             tool_blocks = [b for b in content_blocks if b.get("type") in ("tool_use", "mcp_tool_use")]
             if tool_blocks:
                 tool_results = []
@@ -451,7 +804,6 @@ Use this context naturally. Don't mention that you "remember" things — just ap
             else:
                 break
 
-        # Calculate cost
         input_cost = (total_input_tokens / 1_000_000) * 3
         output_cost = (total_output_tokens / 1_000_000) * 15
         total_cost = round(input_cost + output_cost, 4)
@@ -480,7 +832,6 @@ Use this context naturally. Don't mention that you "remember" things — just ap
             result_type=result_type,
         )
 
-        # Store memories from this interaction
         store_memories(schedule_id, prompt_text[:2000], final_text[:2000])
 
     except Exception as e:
@@ -533,7 +884,6 @@ def run_agent_in_sandbox(
         active_sandboxes[sandbox.sandbox_id] = sandbox
         update_job(job_id, sandbox_id=sandbox.sandbox_id)
 
-        # Write .mcp.json into the sandbox at runtime
         mcp_config = {
             "mcpServers": {
                 "context7": {
@@ -642,10 +992,6 @@ def _extract_result_type(result_text: str) -> str:
 # Task Tier Detection for Scheduled Tasks
 # ------------------------------------------
 def _needs_sandbox(prompt: str) -> bool:
-    """
-    Determine if a scheduled task needs a sandbox (Tier 2) or can use direct API (Tier 1).
-    Default is Tier 1. Sandbox only for code execution, file creation, browser automation.
-    """
     sandbox_patterns = [
         r'\b(write|create|build|generate)\s+(code|script|program|app|website|application)\b',
         r'\b(execute|run)\s+(code|script|python|javascript|bash)\b',
@@ -710,11 +1056,6 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 
 def _run_scheduled_agent(schedule_id: str):
-    """
-    Fired by APScheduler on each cron tick.
-    Routes to Tier 1 (direct API) by default.
-    Only uses Tier 2 (sandbox) if the task needs code execution or browser automation.
-    """
     schedule = get_schedule(schedule_id)
     if not schedule or not schedule.get("enabled"):
         return
@@ -734,8 +1075,6 @@ def _run_scheduled_agent(schedule_id: str):
             composio_mcp_url = fresh_url
             update_schedule(schedule_id, composio_mcp_url=fresh_url)
 
-    # Route decision: use tier from schedule record (set by Task Architect),
-    # fall back to keyword detection for old schedules without a tier
     stored_tier = schedule.get("tier", "")
     if stored_tier == "sandbox":
         use_sandbox = True
@@ -799,6 +1138,33 @@ def startup_event():
     _load_schedules_into_scheduler()
     scheduler.start()
     print("[Scheduler] Started.")
+    # Resume any jobs that were in-progress when Railway restarted
+    try:
+        incomplete = (
+            db.table("agent_jobs")
+            .select("job_id, tier")
+            .eq("status", "processing")
+            .execute()
+        )
+        jobs = incomplete.data or []
+        resumed = 0
+        for job in jobs:
+            cp = _load_latest_checkpoint(job["job_id"])
+            if cp and cp.get("messages_snapshot"):
+                thread = threading.Thread(
+                    target=run_tier1_durable,
+                    args=(job["job_id"],),
+                    daemon=True,
+                )
+                thread.start()
+                resumed += 1
+                print(f"[Startup] Resumed job {job['job_id']}")
+            else:
+                update_job(job["job_id"], status="error",
+                           error="Job lost during server restart (no checkpoint)")
+        print(f"[Startup] Resume check: {resumed} resumed, {len(jobs)} total incomplete")
+    except Exception as e:
+        print(f"[Startup] Resume check failed: {e}")
 
 
 @app.on_event("shutdown")
@@ -842,6 +1208,166 @@ def get_result(job_id: str):
         "session_id": job["session_id"],
         "schedule_id": job.get("schedule_id"),
     }
+
+
+# ===========================================================================
+# DURABLE EXECUTION ENDPOINTS
+# ===========================================================================
+
+# ------------------------------------------
+# POST /execute — Durable Tier 1 execution
+# ------------------------------------------
+@app.post("/execute")
+def execute_durable(body: DurableExecuteRequest):
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+
+    try:
+        updates = {"tier": "api"}
+        if body.session_id:
+            updates["session_id_ref"] = body.session_id
+        if body.agent_id:
+            updates["agent_id"] = body.agent_id
+        db.table("agent_jobs").update(updates).eq("job_id", job_id).execute()
+    except Exception:
+        pass
+
+    thread = threading.Thread(
+        target=run_tier1_durable,
+        args=(job_id,),
+        kwargs={
+            "prompt_text": body.prompt,
+            "session_id": body.session_id,
+            "agent_id": body.agent_id,
+            "composio_mcp_url": body.composio_mcp_url,
+            "composio_api_key": body.composio_api_key,
+            "system_prompt_override": body.system_prompt,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Durable agent started. Poll /result/{job_id} or subscribe to /stream/{job_id}.",
+    }
+
+
+# ------------------------------------------
+# GET /stream/{job_id} — SSE stream of agent steps
+# ------------------------------------------
+@app.get("/stream/{job_id}")
+async def stream_agent_steps(job_id: str):
+    async def event_generator():
+        last_step = -1
+        stale_count = 0
+        max_stale = 300  # 5 min with no new steps
+
+        while True:
+            try:
+                result = (
+                    db.table("agent_steps")
+                    .select("step_number, step_type, tool_name, tool_input, "
+                            "token_text, state, error, iteration, "
+                            "token_count_in, token_count_out, cost_usd, created_at")
+                    .eq("job_id", job_id)
+                    .gt("step_number", last_step)
+                    .order("step_number")
+                    .limit(50)
+                    .execute()
+                )
+
+                steps = result.data or []
+
+                if steps:
+                    stale_count = 0
+                    for step in steps:
+                        yield f"data: {json.dumps(step)}\n\n"
+                        last_step = max(last_step, step["step_number"])
+                else:
+                    stale_count += 1
+
+                job = get_job(job_id)
+                if job and job.get("status") in ("complete", "error"):
+                    yield f"data: {json.dumps({'step_type': 'done', 'status': job['status']})}\n\n"
+                    break
+
+                if stale_count >= max_stale:
+                    yield f"data: {json.dumps({'step_type': 'timeout', 'error': 'No activity for 5 minutes'})}\n\n"
+                    break
+
+            except Exception as e:
+                yield f"data: {json.dumps({'step_type': 'error', 'error': str(e)})}\n\n"
+                break
+
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ------------------------------------------
+# GET /steps/{job_id} — Fetch all steps (non-streaming)
+# ------------------------------------------
+@app.get("/steps/{job_id}")
+def get_steps(job_id: str, after: int = -1, limit: int = 100):
+    result = (
+        db.table("agent_steps")
+        .select("step_number, step_type, tool_name, tool_input, "
+                "token_text, state, error, iteration, "
+                "token_count_in, token_count_out, cost_usd, created_at")
+        .eq("job_id", job_id)
+        .gt("step_number", after)
+        .order("step_number")
+        .limit(limit)
+        .execute()
+    )
+    return {"job_id": job_id, "steps": result.data or []}
+
+
+# ------------------------------------------
+# POST /resume — Resume incomplete jobs after redeploy
+# ------------------------------------------
+@app.post("/resume")
+def resume_incomplete_jobs():
+    try:
+        result = (
+            db.table("agent_jobs")
+            .select("job_id, tier")
+            .eq("status", "processing")
+            .execute()
+        )
+        jobs = result.data or []
+        resumed = 0
+
+        for job in jobs:
+            jid = job["job_id"]
+            checkpoint = _load_latest_checkpoint(jid)
+            if not checkpoint or not checkpoint.get("messages_snapshot"):
+                update_job(jid, status="error",
+                           error="Job lost during server restart (no checkpoint)")
+                continue
+
+            thread = threading.Thread(
+                target=run_tier1_durable,
+                args=(jid,),
+                daemon=True,
+            )
+            thread.start()
+            resumed += 1
+            print(f"[Resume] Resumed job {jid}")
+
+        return {"resumed": resumed, "total_incomplete": len(jobs)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ------------------------------------------
@@ -945,7 +1471,6 @@ def trigger_schedule_now(schedule_id: str):
         if fresh_url:
             composio_mcp_url = fresh_url
 
-    # Route decision: use tier from schedule record, fall back to keyword detection
     stored_tier = schedule.get("tier", "")
     if stored_tier == "sandbox":
         use_sandbox = True
