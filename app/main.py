@@ -473,47 +473,50 @@ def update_memory(user_id: str, task_prompt: str, agent_output: str):
         current_facts = profile.get("facts", {})
         interaction_count = profile.get("interaction_count", 0)
 
-        # Ask Claude to extract new knowledge and update the summary
-        extraction_prompt = f"""You are a memory management system. Analyze this interaction and extract knowledge about the user.
+        # Ask Claude to extract ONLY permanent user knowledge — not task details
+        extraction_prompt = f"""You are a strict memory filter. Your job is to extract ONLY permanent facts about the user from this interaction. Be extremely selective.
 
 CURRENT USER PROFILE:
-{current_summary or "(no profile yet)"}
+{current_summary or "(empty)"}
 
 CURRENT KNOWN FACTS:
-{json.dumps(current_facts) if current_facts else "(none)"}
+{json.dumps(current_facts) if current_facts else "{{}}"}
 
-USER'S REQUEST:
-{task_prompt[:2000]}
+USER SAID:
+{task_prompt[:1500]}
 
-AGENT'S RESPONSE:
-{agent_output[:3000]}
+AGENT PRODUCED:
+{agent_output[:2000]}
 
-Respond with ONLY valid JSON (no markdown, no explanation) in this exact format:
+Respond with ONLY valid JSON. No markdown fences, no explanation.
+
 {{
   "new_facts": {{
-    "name": "user's name if mentioned",
-    "company": "company name if mentioned",
-    "role": "their role if mentioned",
-    "industry": "their industry if mentioned",
-    "other_key": "any other important permanent facts"
+    "name": "only if user stated their name",
+    "company": "only if user stated their company name",
+    "role": "only if user stated their role/title",
+    "industry": "only if clearly identifiable"
   }},
-  "updated_summary": "A concise 200-400 word markdown summary of everything known about this user. Include: who they are, what they do, their preferences, their current projects, and patterns you notice. Write in third person. Update the existing summary with new information — don't start from scratch unless the existing one is empty.",
+  "updated_summary": "2-4 sentence summary of WHO this user is. Only include facts they explicitly stated or that are clearly true. Never speculate. Never include what tasks they asked for. Format: '[Name] is [role] at [company]. [1-2 other confirmed facts.]' If no new identity info was learned, return the existing summary unchanged.",
   "topics_to_update": [
     {{
       "topic": "topic_key",
-      "content": "Updated markdown content for this topic (200-500 words max)",
+      "content": "Permanent knowledge about this topic. Max 3 sentences.",
       "facts": {{"key": "value"}}
     }}
   ]
 }}
 
-Rules:
-- Only include new_facts that were actually mentioned or strongly implied
-- Remove null/empty values from new_facts
-- For updated_summary, MERGE new info with existing — don't lose old facts
-- For topics_to_update, use topic keys like: company, contacts, preferences, projects, writing_style, industry, tools, goals, communication
-- Only include topics where you learned something new
-- Keep everything concise — this is a memory system, not a report"""
+CRITICAL RULES — violations make the memory system worse, not better:
+1. NEVER store what the user asked you to do. "Requested competitive analysis" is NOT a fact — it's a task.
+2. NEVER speculate. "Appears to be fundraising" is speculation. Only store what was explicitly stated.
+3. NEVER store the agent's output or findings as user facts. The competitive landscape is not about the user.
+4. new_facts must be PERMANENT truths: name, company, role, industry, location, preferences. Nothing else.
+5. updated_summary must be ONLY about the user's identity. Not their tasks, not their requests, not today's work.
+6. topics_to_update should ONLY contain durable knowledge. Good: "Company: Corpis builds an AI workforce platform." Bad: "User requested a competitive analysis."
+7. If you learned NOTHING new about the user (just a generic task), return empty new_facts, the existing summary unchanged, and empty topics_to_update.
+8. Topic keys: company, contacts, preferences, projects, writing_style, industry, tools, goals. Only use if you have REAL info.
+9. Remove any key from new_facts where the value is empty, null, or uncertain."""
 
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
