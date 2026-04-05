@@ -457,8 +457,8 @@ def load_memory_context(user_id: str, task_prompt: str) -> str:
 def update_memory(user_id: str, task_prompt: str, agent_output: str):
     """
     Update the three-layer memory after an agent completes.
-    Uses a cheap Claude call to extract new facts, then updates
-    the profile summary and relevant topic files.
+    Uses a cheap Haiku call to extract genuinely new knowledge.
+    Compares against existing memory to avoid redundant storage.
     """
     if not user_id or not agent_output:
         return
@@ -468,56 +468,58 @@ def update_memory(user_id: str, task_prompt: str, agent_output: str):
         if not api_key:
             return
 
-        # Load current profile
+        # Load current state
         profile = _get_memory_profile(user_id)
         current_summary = profile.get("summary_md", "")
-        current_facts = profile.get("facts", {})
         interaction_count = profile.get("interaction_count", 0)
 
-        # Ask Claude to extract ONLY permanent user knowledge — not task details
-        extraction_prompt = f"""You are a strict memory filter. Your job is to extract ONLY permanent facts about the user from this interaction. Be extremely selective.
+        # Load existing topics so the model knows what's already stored
+        try:
+            existing_topics = (
+                db.table("memory_topics")
+                .select("topic, content")
+                .eq("user_id", user_id)
+                .execute()
+            )
+            existing_topics_str = "\n".join(
+                f"- {t['topic']}: {t['content'][:200]}"
+                for t in (existing_topics.data or [])
+            ) or "(none)"
+        except Exception:
+            existing_topics_str = "(none)"
 
-CURRENT USER PROFILE:
-{current_summary or "(empty)"}
+        extraction_prompt = f"""You are a memory deduplication filter. Compare this interaction against what is ALREADY stored and extract ONLY genuinely new information.
 
-CURRENT KNOWN FACTS:
-{json.dumps(current_facts) if current_facts else "{{}}"}
+ALREADY STORED — do NOT repeat any of this:
+Summary: {current_summary or "(empty)"}
+Topics already saved:
+{existing_topics_str}
 
-USER SAID:
-{task_prompt[:1500]}
+NEW INTERACTION:
+User said: {task_prompt[:1500]}
+Agent produced: {agent_output[:2000]}
 
-AGENT PRODUCED:
-{agent_output[:2000]}
-
-Respond with ONLY valid JSON. No markdown fences, no explanation.
+Respond with ONLY valid JSON. No markdown fences.
 
 {{
-  "new_facts": {{
-    "name": "only if user stated their name",
-    "company": "only if user stated their company name",
-    "role": "only if user stated their role/title",
-    "industry": "only if clearly identifiable"
-  }},
-  "updated_summary": "2-4 sentence summary of WHO this user is. Only include facts they explicitly stated or that are clearly true. Never speculate. Never include what tasks they asked for. Format: '[Name] is [role] at [company]. [1-2 other confirmed facts.]' If no new identity info was learned, return the existing summary unchanged.",
+  "has_new_info": true or false,
+  "updated_summary": "If has_new_info is true: rewrite the summary incorporating the new info (keep it 2-5 sentences, identity-focused). If false: return the existing summary EXACTLY as-is, character for character.",
   "topics_to_update": [
     {{
       "topic": "topic_key",
-      "content": "Permanent knowledge about this topic. Max 3 sentences.",
-      "facts": {{"key": "value"}}
+      "content": "New or updated info for this topic. Max 3 sentences. Must contain info NOT already in the stored topics above."
     }}
   ]
 }}
 
-CRITICAL RULES — violations make the memory system worse, not better:
-1. NEVER store what the user asked you to do. "Requested competitive analysis" is NOT a fact — it's a task.
-2. NEVER speculate. "Appears to be fundraising" is speculation. Only store what was explicitly stated.
-3. NEVER store the agent's output or findings as user facts. The competitive landscape is not about the user.
-4. new_facts must be PERMANENT truths: name, company, role, industry, location, preferences. Nothing else.
-5. updated_summary must be ONLY about the user's identity. Not their tasks, not their requests, not today's work.
-6. topics_to_update should ONLY contain durable knowledge. Good: "Company: Corpis builds an AI workforce platform." Bad: "User requested a competitive analysis."
-7. If you learned NOTHING new about the user (just a generic task), return empty new_facts, the existing summary unchanged, and empty topics_to_update.
-8. Topic keys: company, contacts, preferences, projects, writing_style, industry, tools, goals. Only use if you have REAL info.
-9. Remove any key from new_facts where the value is empty, null, or uncertain."""
+RULES:
+1. If you learned NOTHING new about the user beyond what's already stored, set has_new_info to false and return empty topics_to_update. Most interactions will have nothing new — that's correct behavior.
+2. The summary is about WHO the user is: name, role, company, industry. Never include task descriptions.
+3. Topics must contain durable knowledge not already captured. "Corpis builds AI agents" is already stored — don't store it again.
+4. Valid topic keys: company, contacts, preferences, projects, writing_style, industry, tools, goals.
+5. Never speculate. Never store what tasks were requested. Never store the agent's research findings as user knowledge.
+6. If a topic already exists with the same info, do NOT include it in topics_to_update.
+7. Genuinely new info examples: a new contact name mentioned, a preference expressed ("I prefer bullet points"), a new project mentioned, a tool preference stated. These are rare — most chats won't have any."""
 
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -528,7 +530,7 @@ CRITICAL RULES — violations make the memory system worse, not better:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 2000,
+                "max_tokens": 1500,
                 "messages": [{"role": "user", "content": extraction_prompt}],
             },
             timeout=30,
@@ -544,8 +546,7 @@ CRITICAL RULES — violations make the memory system worse, not better:
             if b.get("type") == "text"
         ).strip()
 
-        # Parse the JSON response
-        # Strip markdown code fences if present
+        # Parse JSON
         clean_text = raw_text
         if clean_text.startswith("```"):
             clean_text = re.sub(r'^```(?:json)?\s*', '', clean_text)
@@ -557,37 +558,43 @@ CRITICAL RULES — violations make the memory system worse, not better:
             print(f"[Memory] Failed to parse extraction response: {raw_text[:200]}")
             return
 
-        # ── Update Layer 1: Profile summary ──
-        new_facts = extracted.get("new_facts", {})
-        # Remove empty values
-        new_facts = {k: v for k, v in new_facts.items() if v and v.strip()}
-        merged_facts = {**current_facts, **new_facts}
+        has_new_info = extracted.get("has_new_info", False)
 
-        updated_summary = extracted.get("updated_summary", current_summary)
-        if not updated_summary or len(updated_summary) < 20:
-            updated_summary = current_summary
-
+        # Always increment interaction count
         try:
             db.table("memory_profiles").upsert({
                 "user_id": user_id,
-                "summary_md": updated_summary[:5000],
-                "facts": merged_facts,
+                "summary_md": extracted.get("updated_summary", current_summary)[:5000] if has_new_info else current_summary,
+                "facts": {},  # Facts removed — summary is the source of truth
                 "interaction_count": interaction_count + 1,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }, on_conflict="user_id").execute()
-            print(f"[Memory] Updated profile for {user_id}: "
-                  f"{len(updated_summary)} chars, {len(merged_facts)} facts")
         except Exception as e:
             print(f"[Memory] Failed to update profile: {e}")
 
-        # ── Update Layer 2+3: Topic files ──
+        if not has_new_info:
+            print(f"[Memory] No new info for {user_id} (interaction #{interaction_count + 1})")
+            return
+
+        # Update summary
+        updated_summary = extracted.get("updated_summary", current_summary)
+        if updated_summary and len(updated_summary) >= 20 and updated_summary != current_summary:
+            try:
+                db.table("memory_profiles").update({
+                    "summary_md": updated_summary[:5000],
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("user_id", user_id).execute()
+                print(f"[Memory] Updated summary for {user_id}: {len(updated_summary)} chars")
+            except Exception as e:
+                print(f"[Memory] Failed to update summary: {e}")
+
+        # Update topics — only genuinely new ones
         topics_to_update = extracted.get("topics_to_update", [])
         for topic_data in topics_to_update:
             topic_key = topic_data.get("topic", "").strip().lower().replace(" ", "_")
             topic_content = topic_data.get("content", "").strip()
-            topic_facts = topic_data.get("facts", {})
 
-            if not topic_key or not topic_content:
+            if not topic_key or not topic_content or len(topic_content) < 10:
                 continue
 
             try:
@@ -595,10 +602,10 @@ CRITICAL RULES — violations make the memory system worse, not better:
                     "user_id": user_id,
                     "topic": topic_key,
                     "content": topic_content[:5000],
-                    "facts": topic_facts if isinstance(topic_facts, dict) else {},
+                    "facts": {},
                     "confidence": 1.0,
                     "last_verified_at": datetime.now(timezone.utc).isoformat(),
-                    "source_count": 1,  # Will increment on conflict via trigger or next update
+                    "source_count": 1,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }, on_conflict="user_id,topic").execute()
             except Exception as e:
@@ -634,7 +641,6 @@ def get_user_memory_summary(user_id: str) -> dict:
         "user_id": user_id,
         "profile": {
             "summary": profile.get("summary_md", ""),
-            "facts": profile.get("facts", {}),
             "interaction_count": profile.get("interaction_count", 0),
         },
         "topics": topics,
