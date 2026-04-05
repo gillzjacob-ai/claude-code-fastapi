@@ -457,8 +457,8 @@ def load_memory_context(user_id: str, task_prompt: str) -> str:
 def update_memory(user_id: str, task_prompt: str, agent_output: str):
     """
     Update the three-layer memory after an agent completes.
-    Uses a cheap Haiku call to extract genuinely new knowledge.
-    Compares against existing memory to avoid redundant storage.
+    Uses Sonnet to extract genuinely new user identity info.
+    Compares against existing memory to avoid duplicates.
     """
     if not user_id or not agent_output:
         return
@@ -473,7 +473,7 @@ def update_memory(user_id: str, task_prompt: str, agent_output: str):
         current_summary = profile.get("summary_md", "")
         interaction_count = profile.get("interaction_count", 0)
 
-        # Load existing topics so the model knows what's already stored
+        # Load existing topics
         try:
             existing_topics = (
                 db.table("memory_topics")
@@ -481,48 +481,44 @@ def update_memory(user_id: str, task_prompt: str, agent_output: str):
                 .eq("user_id", user_id)
                 .execute()
             )
-            existing_topics_str = "\n".join(
-                f"- {t['topic']}: {t['content'][:200]}"
-                for t in (existing_topics.data or [])
-            ) or "(none)"
+            existing_topics_list = existing_topics.data or []
         except Exception:
-            existing_topics_str = "(none)"
+            existing_topics_list = []
 
-        extraction_prompt = f"""Extract permanent knowledge about this user. You must write NEW sentences — never copy text from the input.
+        # Build a concise representation of what we already know
+        known_info = current_summary or ""
+        for t in existing_topics_list:
+            known_info += f"\n{t.get('topic', '')}: {t.get('content', '')}"
 
-EXISTING MEMORY (do not repeat):
-{current_summary or "(empty)"}
-{existing_topics_str}
+        extraction_prompt = f"""You are updating a user memory file. Read the interaction below and answer these questions.
 
-FROM THIS INTERACTION, the user revealed:
-- Their request: {task_prompt[:800]}
-- The agent delivered a response about: {agent_output[:500]}
+WHAT WE ALREADY KNOW ABOUT THIS USER:
+{known_info.strip() or "Nothing yet."}
 
-OUTPUT FORMAT — respond with ONLY this JSON, no other text:
-{{
-  "has_new_info": true,
-  "updated_summary": "Write 1-3 original sentences about who this person is. Example: 'Jacob is the Founder of Corpis, an AI workforce platform company.' NEVER copy the user's request text. NEVER mention what task they asked for.",
-  "topics_to_update": []
-}}
+THE USER'S MESSAGE WAS:
+"{task_prompt[:500]}"
 
-Or if nothing new was learned:
-{{
-  "has_new_info": false,
-  "updated_summary": "{current_summary}",
-  "topics_to_update": []
-}}
+Answer each question with the extracted value, or "unknown" if not mentioned:
+1. User's name?
+2. User's role/title?
+3. User's company?
+4. What does their company do? (one sentence max)
+5. Their industry?
+6. Any stated preferences? (e.g. formatting, tone, tools they like)
+7. Any contacts/people they mentioned by name?
 
-WHAT COUNTS AS NEW INFO (extract these):
-- Name, role, title, company name, industry
-- Stated preferences ("I like concise reports")
-- Contact names they mention ("send this to Sarah")
-- Tools or platforms they use
+Then write a PROFILE line — a single sentence describing this user based on ALL known info (existing + new). Example: "Jacob is the Founder & CEO of Corpis, an AI workforce platform."
 
-WHAT IS NOT MEMORY (never extract these):
-- What task they asked for
-- What the agent researched or produced
-- The user's prompt text (never copy it)
-- Speculation about their goals or stage"""
+Respond in this exact format:
+NAME: [value or unknown]
+ROLE: [value or unknown]
+COMPANY: [value or unknown]
+COMPANY_DESC: [value or unknown]
+INDUSTRY: [value or unknown]
+PREFERENCES: [value or unknown]
+CONTACTS: [value or unknown]
+PROFILE: [one sentence]
+NEW_INFO: [yes or no — did you learn anything not already in the existing memory?]"""
 
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -533,7 +529,7 @@ WHAT IS NOT MEMORY (never extract these):
             },
             json={
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 1000,
+                "max_tokens": 500,
                 "messages": [{"role": "user", "content": extraction_prompt}],
             },
             timeout=30,
@@ -549,62 +545,79 @@ WHAT IS NOT MEMORY (never extract these):
             if b.get("type") == "text"
         ).strip()
 
-        # Parse JSON
-        clean_text = raw_text
-        if clean_text.startswith("```"):
-            clean_text = re.sub(r'^```(?:json)?\s*', '', clean_text)
-            clean_text = re.sub(r'\s*```$', '', clean_text)
+        # Parse the structured response
+        lines = {}
+        for line in raw_text.split("\n"):
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip().upper()
+                value = value.strip()
+                if value and value.lower() != "unknown":
+                    lines[key] = value
 
-        try:
-            extracted = json.loads(clean_text)
-        except json.JSONDecodeError:
-            print(f"[Memory] Failed to parse extraction response: {raw_text[:200]}")
-            return
-
-        has_new_info = extracted.get("has_new_info", False)
+        new_info = lines.get("NEW_INFO", "no").lower().startswith("y")
+        profile_text = lines.get("PROFILE", "")
 
         # Always increment interaction count
         try:
-            db.table("memory_profiles").upsert({
+            update_data = {
                 "user_id": user_id,
-                "summary_md": extracted.get("updated_summary", current_summary)[:5000] if has_new_info else current_summary,
-                "facts": {},  # Facts removed — summary is the source of truth
                 "interaction_count": interaction_count + 1,
+                "facts": {},
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="user_id").execute()
+            }
+            # Only update summary if we have new info and a valid profile
+            if new_info and profile_text and len(profile_text) > 10:
+                update_data["summary_md"] = profile_text[:5000]
+            else:
+                update_data["summary_md"] = current_summary or ""
+
+            db.table("memory_profiles").upsert(
+                update_data, on_conflict="user_id"
+            ).execute()
         except Exception as e:
             print(f"[Memory] Failed to update profile: {e}")
 
-        if not has_new_info:
+        if not new_info:
             print(f"[Memory] No new info for {user_id} (interaction #{interaction_count + 1})")
             return
 
-        # Update summary
-        updated_summary = extracted.get("updated_summary", current_summary)
-        if updated_summary and len(updated_summary) >= 20 and updated_summary != current_summary:
-            try:
-                db.table("memory_profiles").update({
-                    "summary_md": updated_summary[:5000],
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("user_id", user_id).execute()
-                print(f"[Memory] Updated summary for {user_id}: {len(updated_summary)} chars")
-            except Exception as e:
-                print(f"[Memory] Failed to update summary: {e}")
+        print(f"[Memory] New info for {user_id}: {profile_text[:100]}")
 
-        # Update topics — only genuinely new ones
-        topics_to_update = extracted.get("topics_to_update", [])
-        for topic_data in topics_to_update:
-            topic_key = topic_data.get("topic", "").strip().lower().replace(" ", "_")
-            topic_content = topic_data.get("content", "").strip()
+        # Update topic if we learned about the company
+        company_desc = lines.get("COMPANY_DESC", "")
+        company_name = lines.get("COMPANY", "")
+        if company_desc and len(company_desc) > 10:
+            # Check if we already have this info
+            existing_company = next(
+                (t for t in existing_topics_list if t.get("topic") == "company"),
+                None,
+            )
+            if not existing_company or company_desc not in existing_company.get("content", ""):
+                try:
+                    content = f"{company_name}: {company_desc}" if company_name else company_desc
+                    db.table("memory_topics").upsert({
+                        "user_id": user_id,
+                        "topic": "company",
+                        "content": content[:5000],
+                        "facts": {},
+                        "confidence": 1.0,
+                        "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                        "source_count": 1,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }, on_conflict="user_id,topic").execute()
+                    print(f"[Memory] Updated company topic for {user_id}")
+                except Exception as e:
+                    print(f"[Memory] Failed to update company topic: {e}")
 
-            if not topic_key or not topic_content or len(topic_content) < 10:
-                continue
-
+        # Update preferences if stated
+        preferences = lines.get("PREFERENCES", "")
+        if preferences and len(preferences) > 5:
             try:
                 db.table("memory_topics").upsert({
                     "user_id": user_id,
-                    "topic": topic_key,
-                    "content": topic_content[:5000],
+                    "topic": "preferences",
+                    "content": preferences[:5000],
                     "facts": {},
                     "confidence": 1.0,
                     "last_verified_at": datetime.now(timezone.utc).isoformat(),
@@ -612,11 +625,29 @@ WHAT IS NOT MEMORY (never extract these):
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }, on_conflict="user_id,topic").execute()
             except Exception as e:
-                print(f"[Memory] Failed to update topic {topic_key}: {e}")
+                print(f"[Memory] Failed to update preferences topic: {e}")
 
-        if topics_to_update:
-            print(f"[Memory] Updated {len(topics_to_update)} topics for {user_id}: "
-                  f"{', '.join(t.get('topic', '?') for t in topics_to_update)}")
+        # Update contacts if mentioned
+        contacts = lines.get("CONTACTS", "")
+        if contacts and len(contacts) > 3:
+            try:
+                existing_contacts = next(
+                    (t for t in existing_topics_list if t.get("topic") == "contacts"),
+                    None,
+                )
+                merged = existing_contacts.get("content", "") + "\n" + contacts if existing_contacts else contacts
+                db.table("memory_topics").upsert({
+                    "user_id": user_id,
+                    "topic": "contacts",
+                    "content": merged.strip()[:5000],
+                    "facts": {},
+                    "confidence": 1.0,
+                    "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                    "source_count": 1,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }, on_conflict="user_id,topic").execute()
+            except Exception as e:
+                print(f"[Memory] Failed to update contacts topic: {e}")
 
     except Exception as e:
         print(f"[Memory] Update failed for {user_id}: {e}")
