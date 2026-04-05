@@ -488,38 +488,41 @@ def update_memory(user_id: str, task_prompt: str, agent_output: str):
         except Exception:
             existing_topics_str = "(none)"
 
-        extraction_prompt = f"""You are a memory deduplication filter. Compare this interaction against what is ALREADY stored and extract ONLY genuinely new information.
+        extraction_prompt = f"""Extract permanent knowledge about this user. You must write NEW sentences — never copy text from the input.
 
-ALREADY STORED — do NOT repeat any of this:
-Summary: {current_summary or "(empty)"}
-Topics already saved:
+EXISTING MEMORY (do not repeat):
+{current_summary or "(empty)"}
 {existing_topics_str}
 
-NEW INTERACTION:
-User said: {task_prompt[:1500]}
-Agent produced: {agent_output[:2000]}
+FROM THIS INTERACTION, the user revealed:
+- Their request: {task_prompt[:800]}
+- The agent delivered a response about: {agent_output[:500]}
 
-Respond with ONLY valid JSON. No markdown fences.
-
+OUTPUT FORMAT — respond with ONLY this JSON, no other text:
 {{
-  "has_new_info": true or false,
-  "updated_summary": "If has_new_info is true: rewrite the summary incorporating the new info (keep it 2-5 sentences, identity-focused). If false: return the existing summary EXACTLY as-is, character for character.",
-  "topics_to_update": [
-    {{
-      "topic": "topic_key",
-      "content": "New or updated info for this topic. Max 3 sentences. Must contain info NOT already in the stored topics above."
-    }}
-  ]
+  "has_new_info": true,
+  "updated_summary": "Write 1-3 original sentences about who this person is. Example: 'Jacob is the Founder of Corpis, an AI workforce platform company.' NEVER copy the user's request text. NEVER mention what task they asked for.",
+  "topics_to_update": []
 }}
 
-RULES:
-1. If you learned NOTHING new about the user beyond what's already stored, set has_new_info to false and return empty topics_to_update. Most interactions will have nothing new — that's correct behavior.
-2. The summary is about WHO the user is: name, role, company, industry. Never include task descriptions.
-3. Topics must contain durable knowledge not already captured. "Corpis builds AI agents" is already stored — don't store it again.
-4. Valid topic keys: company, contacts, preferences, projects, writing_style, industry, tools, goals.
-5. Never speculate. Never store what tasks were requested. Never store the agent's research findings as user knowledge.
-6. If a topic already exists with the same info, do NOT include it in topics_to_update.
-7. Genuinely new info examples: a new contact name mentioned, a preference expressed ("I prefer bullet points"), a new project mentioned, a tool preference stated. These are rare — most chats won't have any."""
+Or if nothing new was learned:
+{{
+  "has_new_info": false,
+  "updated_summary": "{current_summary}",
+  "topics_to_update": []
+}}
+
+WHAT COUNTS AS NEW INFO (extract these):
+- Name, role, title, company name, industry
+- Stated preferences ("I like concise reports")
+- Contact names they mention ("send this to Sarah")
+- Tools or platforms they use
+
+WHAT IS NOT MEMORY (never extract these):
+- What task they asked for
+- What the agent researched or produced
+- The user's prompt text (never copy it)
+- Speculation about their goals or stage"""
 
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -529,8 +532,8 @@ RULES:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1500,
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1000,
                 "messages": [{"role": "user", "content": extraction_prompt}],
             },
             timeout=30,
