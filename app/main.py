@@ -157,6 +157,7 @@ active_sandboxes = {}
 class ClaudePrompt(BaseModel):
     prompt: str
     repo: Optional[str] = None
+    user_id: Optional[str] = None
     composio_mcp_url: Optional[str] = None
     composio_api_key: Optional[str] = None
 
@@ -1334,10 +1335,22 @@ def run_agent_in_sandbox(
     repo: Optional[str],
     session: Optional[str],
     schedule_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     composio_mcp_url: Optional[str] = None,
     composio_api_key: Optional[str] = None,
 ):
     try:
+        # ── Inject memory context into prompt ──
+        memory_user_id = user_id or schedule_id or None
+        if memory_user_id and prompt_text:
+            memory_context = load_memory_context(memory_user_id, prompt_text)
+            if memory_context:
+                prompt_text = f"""{memory_context}
+
+---
+
+{prompt_text}"""
+
         sandbox_envs = {
             "GITHUB_PAT": os.getenv("GITHUB_PAT", ""),
             "CONTEXT7_API_KEY": os.getenv("CONTEXT7_API_KEY", ""),
@@ -1431,6 +1444,14 @@ def run_agent_in_sandbox(
             result=claude_response,
             session_id=claude_response.get("session_id"),
         )
+
+        # ── Update three-layer memory ──
+        result_text = claude_response.get("result", "") or ""
+        if memory_user_id and result_text:
+            try:
+                update_memory(memory_user_id, prompt_text[:2000], result_text[:3000])
+            except Exception as mem_err:
+                print(f"[Tier2] Memory update failed (non-fatal): {mem_err}")
 
         if schedule_id:
             result_text = claude_response.get("result", "") or ""
@@ -1667,7 +1688,7 @@ def prompt(prompt: ClaudePrompt, session: Optional[str] = None):
     thread = threading.Thread(
         target=run_agent_in_sandbox,
         args=(job_id, prompt.prompt, prompt.repo, session),
-        kwargs={"composio_mcp_url": prompt.composio_mcp_url, "composio_api_key": prompt.composio_api_key},
+        kwargs={"user_id": prompt.user_id, "composio_mcp_url": prompt.composio_mcp_url, "composio_api_key": prompt.composio_api_key},
         daemon=True,
     )
     thread.start()
