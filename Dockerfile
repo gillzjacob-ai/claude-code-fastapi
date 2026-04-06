@@ -2,7 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies via pip (no uv, no lockfile needed)
+# Install system dependencies for production-quality PDF generation
+# gcc + pkg-config + libcairo2-dev are required by pycairo (used by xhtml2pdf)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    pkg-config \
+    libcairo2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml .
 RUN pip install --no-cache-dir \
     "fastapi[standard]>=0.116.1" \
