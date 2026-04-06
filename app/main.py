@@ -964,6 +964,7 @@ def run_tier1_durable(
         # We NEVER fall back to session_id — that would scatter memories
         # across sessions instead of aggregating per user.
         memory_user_id = user_id or schedule_id or None
+        print(f"[Tier1-Durable] Memory resolution: user_id={user_id}, schedule_id={schedule_id}, memory_user_id={memory_user_id}")
 
         # ── Inject memory context into prompt (Layer 1 always, Layer 2 on demand) ──
         if memory_user_id and prompt_text:
@@ -1765,6 +1766,8 @@ def get_result(job_id: str):
 def execute_durable(body: DurableExecuteRequest):
     job_id = str(uuid.uuid4())
     create_job(job_id)
+
+    print(f"[Execute] Received: user_id={body.user_id}, session_id={body.session_id}, agent_id={body.agent_id}, prompt={body.prompt[:80]}")
 
     try:
         updates = {"tier": "api"}
