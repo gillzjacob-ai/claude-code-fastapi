@@ -4,8 +4,11 @@
 # Converts markdown content to .docx and .pdf files.
 # Used by the /convert-document endpoint.
 #
-# Dependencies (add to Dockerfile):
-#   pip install python-docx markdown xhtml2pdf
+# Dependencies:
+#   pip install python-docx markdown xhtml2pdf beautifulsoup4
+#
+# System dependencies (Dockerfile):
+#   apt-get install gcc pkg-config libcairo2-dev
 # =============================================================================
 
 import io
@@ -55,7 +58,6 @@ def _add_element_to_docx(doc: Document, element):
     if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
         level = int(tag[1])
         heading = doc.add_heading(element.get_text(), level=min(level, 4))
-        # Style headings
         for run in heading.runs:
             run.font.color.rgb = RGBColor(0x1a, 0x1a, 0x2e)
     
@@ -71,7 +73,6 @@ def _add_element_to_docx(doc: Document, element):
     elif tag == 'blockquote':
         text = element.get_text().strip()
         para = doc.add_paragraph(text)
-        para.style = doc.styles['Intense Quote'] if 'Intense Quote' in [s.name for s in doc.styles] else doc.styles['Normal']
         para.paragraph_format.left_indent = Inches(0.5)
     
     elif tag == 'pre':
@@ -95,7 +96,6 @@ def _add_element_to_docx(doc: Document, element):
         run.font.size = Pt(8)
     
     else:
-        # Recurse into unknown container elements
         for child in element.children:
             _add_element_to_docx(doc, child)
 
@@ -123,7 +123,6 @@ def _add_inline_formatting(para, element):
             run.font.color.rgb = RGBColor(0x06, 0x45, 0xAD)
             run.underline = True
         else:
-            # Recurse
             _add_inline_formatting(para, child)
 
 
@@ -131,14 +130,12 @@ def _add_table_to_docx(doc: Document, table_element):
     """Convert an HTML table to a docx table."""
     rows_data = []
     
-    # Get header rows
     thead = table_element.find('thead')
     if thead:
         for tr in thead.find_all('tr'):
             cells = [td.get_text().strip() for td in tr.find_all(['th', 'td'])]
             rows_data.append(cells)
     
-    # Get body rows
     tbody = table_element.find('tbody') or table_element
     for tr in tbody.find_all('tr'):
         cells = [td.get_text().strip() for td in tr.find_all(['th', 'td'])]
@@ -157,7 +154,6 @@ def _add_table_to_docx(doc: Document, table_element):
             if j < max_cols:
                 cell = table.rows[i].cells[j]
                 cell.text = cell_text
-                # Bold header row
                 if i == 0:
                     for paragraph in cell.paragraphs:
                         for run in paragraph.runs:
@@ -166,10 +162,8 @@ def _add_table_to_docx(doc: Document, table_element):
 
 def markdown_to_pdf(md_content: str, title: str = "Document") -> bytes:
     """Convert markdown content to a .pdf file. Returns bytes."""
-    # Convert markdown to HTML
     html_body = markdown.markdown(md_content, extensions=['tables', 'fenced_code', 'nl2br'])
     
-    # Wrap in a full HTML document with CSS for professional styling
     full_html = f"""<!DOCTYPE html>
 <html>
 <head>
