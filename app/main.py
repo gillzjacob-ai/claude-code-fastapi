@@ -1956,6 +1956,92 @@ def clear_memory_topic(user_id: str, topic: str):
 
 
 # ------------------------------------------
+# POST /memory/{user_id}/update — Trigger memory extraction from a conversation
+# Used by "add to memory" from chat followup
+# ------------------------------------------
+class MemoryUpdateRequest(BaseModel):
+    prompt: str
+    output: str = ""
+
+
+@app.post("/memory/{user_id}/update")
+def trigger_memory_update(user_id: str, body: MemoryUpdateRequest):
+    try:
+        update_memory(user_id, body.prompt, body.output or body.prompt)
+        profile = _get_memory_profile(user_id)
+        return {
+            "user_id": user_id,
+            "updated": True,
+            "summary": profile.get("summary_md", ""),
+            "interaction_count": profile.get("interaction_count", 0),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ------------------------------------------
+# POST /memory/{user_id}/add — Add a manual memory entry
+# Used by the Memory panel "Add" button
+# ------------------------------------------
+class ManualMemoryRequest(BaseModel):
+    content: str
+    topic: Optional[str] = None
+
+
+@app.post("/memory/{user_id}/add")
+def add_manual_memory(user_id: str, body: ManualMemoryRequest):
+    try:
+        if body.topic:
+            # Add as a topic entry
+            topic_key = body.topic.strip().lower().replace(" ", "_")
+            # Check if topic exists and append
+            try:
+                existing = (
+                    db.table("memory_topics")
+                    .select("content")
+                    .eq("user_id", user_id)
+                    .eq("topic", topic_key)
+                    .execute()
+                )
+                if existing.data and existing.data[0].get("content"):
+                    merged = existing.data[0]["content"] + "\n" + body.content
+                else:
+                    merged = body.content
+            except Exception:
+                merged = body.content
+
+            db.table("memory_topics").upsert({
+                "user_id": user_id,
+                "topic": topic_key,
+                "content": merged.strip()[:5000],
+                "facts": {},
+                "confidence": 1.0,
+                "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                "source_count": 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id,topic").execute()
+
+            return {"user_id": user_id, "added": True, "type": "topic", "topic": topic_key}
+        else:
+            # Add as a general memory — append to profile summary
+            profile = _get_memory_profile(user_id)
+            current = profile.get("summary_md", "")
+            updated = (current + " " + body.content).strip() if current else body.content
+
+            db.table("memory_profiles").upsert({
+                "user_id": user_id,
+                "summary_md": updated[:5000],
+                "facts": {},
+                "interaction_count": profile.get("interaction_count", 0),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
+
+            return {"user_id": user_id, "added": True, "type": "profile", "summary": updated}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ------------------------------------------
 # Schedule CRUD
 # ------------------------------------------
 @app.post("/schedules")
