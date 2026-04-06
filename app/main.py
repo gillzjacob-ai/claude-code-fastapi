@@ -17,6 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from e2b import Sandbox
 from supabase import create_client, Client
+from app.document_converter import markdown_to_docx, markdown_to_pdf
 
 # ------------------------------------------
 # Startup Validation
@@ -170,6 +171,13 @@ class DurableExecuteRequest(BaseModel):
     composio_mcp_url: Optional[str] = None
     composio_api_key: Optional[str] = None
     system_prompt: Optional[str] = None
+
+
+class ConvertDocumentRequest(BaseModel):
+    content: str
+    title: str = "Document"
+    session_id: str
+    formats: list = ["docx", "pdf"]
 
 
 class FileInfo(BaseModel):
@@ -1757,6 +1765,51 @@ def get_result(job_id: str):
         "session_id": job["session_id"],
         "schedule_id": job.get("schedule_id"),
     }
+
+
+# ------------------------------------------
+# POST /convert-document — Markdown to DOCX/PDF
+# ------------------------------------------
+@app.post("/convert-document")
+def convert_document(body: ConvertDocumentRequest):
+    """Convert markdown content to .docx and/or .pdf, upload to Supabase storage."""
+    results = {}
+    safe_title = re.sub(r'[^a-zA-Z0-9._-]', '_', body.title)[:60]
+
+    for fmt in body.formats:
+        try:
+            if fmt == "docx":
+                file_bytes = markdown_to_docx(body.content, body.title)
+                content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                filename = f"{safe_title}.docx"
+            elif fmt == "pdf":
+                file_bytes = markdown_to_pdf(body.content, body.title)
+                content_type = "application/pdf"
+                filename = f"{safe_title}.pdf"
+            else:
+                continue
+
+            path = f"{body.session_id}/{int(datetime.now(timezone.utc).timestamp())}_{filename}"
+            db.storage.from_("agent-files").upload(
+                path, file_bytes,
+                {"content-type": content_type, "upsert": "false"}
+            )
+
+            url_data = db.storage.from_("agent-files").get_public_url(path)
+
+            results[fmt] = {
+                "filename": filename,
+                "url": url_data,
+                "content_type": content_type,
+                "size": len(file_bytes),
+            }
+            print(f"[Convert] {fmt}: {filename} ({len(file_bytes)} bytes) -> {url_data}")
+
+        except Exception as e:
+            print(f"[Convert] Error generating {fmt}: {e}")
+            results[fmt] = {"error": str(e)}
+
+    return {"files": results}
 
 
 # ===========================================================================
