@@ -1626,7 +1626,11 @@ def _run_scheduled_agent(schedule_id: str):
     elif stored_tier == "api":
         use_sandbox = False
     else:
+        # No tier stored — classify once and persist so it never re-classifies
         use_sandbox = _needs_sandbox(schedule.get("agent_prompt", ""))
+        persisted_tier = "sandbox" if use_sandbox else "api"
+        update_schedule(schedule_id, tier=persisted_tier)
+        print(f"[Scheduler] Persisted tier={persisted_tier} for schedule {schedule_id}")
 
     if use_sandbox:
         print(f"[Scheduler] {schedule_id} -> Tier 2 (sandbox)")
@@ -2148,7 +2152,11 @@ def trigger_schedule_now(schedule_id: str):
     elif stored_tier == "api":
         use_sandbox = False
     else:
+        # No tier stored — classify once and persist
         use_sandbox = _needs_sandbox(schedule.get("agent_prompt", ""))
+        persisted_tier = "sandbox" if use_sandbox else "api"
+        update_schedule(schedule_id, tier=persisted_tier)
+        print(f"[Manual] Persisted tier={persisted_tier} for schedule {schedule_id}")
 
     if use_sandbox:
         print(f"[Manual] {schedule_id} -> Tier 2 (sandbox)")
