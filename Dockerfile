@@ -10,7 +10,11 @@ RUN pip install --no-cache-dir \
     "e2b==2.1.2" \
     "httpx>=0.27.0" \
     "supabase>=2.28.0" \
-    "apscheduler>=3.10.0"
+    "apscheduler>=3.10.0" \
+    "python-docx>=1.1.0" \
+    "markdown>=3.5" \
+    "xhtml2pdf>=0.2.16" \
+    "beautifulsoup4>=4.12.0"
 
 # Copy application code
 COPY . .
