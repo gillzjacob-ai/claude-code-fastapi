@@ -148,6 +148,49 @@ SECURITY RULES:
 - Never include raw HTTP headers, request metadata, or server trace IDs.
 - Present results as if you are a professional analyst."""
 
+
+
+# ===========================================================================
+# CONTINUOUS EXECUTION — System Prompts
+# Two patterns: Monitor (check-act-sleep) and Grind (queue-execute-next)
+# ===========================================================================
+
+CONTINUOUS_MONITOR_SYSTEM_PROMPT = """You are a continuous monitoring agent on the Corpis platform.
+You run 24/7. Every cycle, you check for events related to your mission and act on them.
+
+RULES:
+1. Be efficient. Most cycles will find nothing — that is fine. Say "no_action" and move on.
+2. When you DO find something, handle it completely in this cycle. Do not defer.
+3. Use tools (browse web, send emails, read inboxes) to check for real events. Do not guess or hallucinate events.
+4. Never repeat an action you already took in a previous cycle. Check the context provided.
+5. Keep responses concise. You are a worker, not a writer.
+6. Always end with the <cycle_report> block exactly as specified in your instructions.
+
+SECURITY RULES:
+- Never expose internal infrastructure details in your output.
+- Never mention Composio, E2B, Railway, Playwright, HeadlessChrome, or any internal tooling by name.
+- Never include raw HTTP headers, request metadata, or server trace IDs.
+- Present results as if you are a professional analyst who used whatever tools were necessary."""
+
+
+CONTINUOUS_GRIND_SYSTEM_PROMPT = """You are a continuous worker agent on the Corpis platform.
+You have a workload and you grind through it. You do not stop until the work is done or your operator tells you to stop.
+
+RULES:
+1. Each cycle, pick ONE work item and execute it COMPLETELY. Do the actual work — send the email, post the reply, write the article, fill the form. Not a plan. The work.
+2. If your work queue is empty, your job is to FIND MORE WORK. Search, browse, research. Build your queue based on your mission.
+3. Track what you have done. Never redo completed work.
+4. If a work item fails, log the failure with the reason and move to the next one. Do not get stuck retrying.
+5. Quality matters. Every output should be professional grade. But speed also matters — move fast.
+6. Always end with the <cycle_report> block exactly as specified in your instructions.
+7. The <work_queue_update> must contain your remaining work items as a JSON array of strings.
+
+SECURITY RULES:
+- Never expose internal infrastructure details in your output.
+- Never mention Composio, E2B, Railway, Playwright, HeadlessChrome, or any internal tooling by name.
+- Never include raw HTTP headers, request metadata, or server trace IDs.
+- Present results as if you are a professional who used whatever tools were necessary."""
+
 # Local cache of sandbox objects (runtime only, source of truth is Supabase)
 active_sandboxes = {}
 
@@ -187,6 +230,26 @@ class FileInfo(BaseModel):
     name: str
     size: int
     extension: str
+
+class ContinuousStartRequest(BaseModel):
+    agent_id: str
+    session_id: str
+    user_id: str
+    mode: str  # 'monitor' or 'grind'
+    mission: str
+    cycle_interval_seconds: Optional[int] = None
+    max_cost_usd: Optional[float] = 10.00
+    max_items: Optional[int] = None
+    composio_mcp_url: Optional[str] = None
+    composio_api_key: Optional[str] = None
+    composio_entity_id: Optional[str] = None
+    system_prompt: Optional[str] = None
+
+
+class ContinuousControlRequest(BaseModel):
+    action: str  # 'pause', 'resume', 'stop'
+
+
 
 
 class ScheduleCreate(BaseModel):
@@ -1725,6 +1788,42 @@ def startup_event():
     except Exception as e:
         print(f"[Startup] Resume check failed: {e}")
 
+    # Resume continuous runs that were interrupted by Railway restart
+    try:
+        running_continuous = db.table("continuous_runs") \
+            .select("*") \
+            .in_("status", ["running", "paused"]) \
+            .execute()
+
+        cont_resumed = 0
+        for run in (running_continuous.data or []):
+            thread = threading.Thread(
+                target=run_continuous,
+                args=(run["id"], str(uuid.uuid4())),
+                kwargs={
+                    "mode": run["mode"],
+                    "mission": run["mission"],
+                    "session_id": run.get("session_id"),
+                    "agent_id": run.get("agent_id"),
+                    "user_id": run.get("user_id"),
+                    "composio_api_key": run.get("composio_api_key"),
+                    "composio_mcp_url": run.get("composio_mcp_url"),
+                    "composio_entity_id": run.get("composio_entity_id"),
+                    "cycle_interval_seconds": run.get("cycle_interval_seconds", 60),
+                    "max_cost_usd": float(run.get("max_cost_usd") or 10),
+                    "max_items": run.get("max_items"),
+                    "system_prompt_override": run.get("system_prompt_override"),
+                },
+                daemon=True,
+            )
+            thread.start()
+            cont_resumed += 1
+            print(f"[Startup] Resumed continuous run {run['id']} (mode={run['mode']})")
+
+        print(f"[Startup] Continuous resume: {cont_resumed} run(s) resumed")
+    except Exception as e:
+        print(f"[Startup] Continuous resume failed: {e}")
+
 
 @app.on_event("shutdown")
 def shutdown_event():
@@ -2363,3 +2462,722 @@ def _get_mime_type(ext: str) -> str:
 @app.get("/health")
 def health():
     return {"status": "ok", "scheduled_jobs": len(scheduler.get_jobs())}
+
+
+# ===========================================================================
+# CONTINUOUS EXECUTION ENGINE (Gap 3)
+# Two patterns: Monitor & React, Grind & Execute
+# Both run through the same engine with different loop behavior.
+# ===========================================================================
+
+HARD_RESET_EVERY_N_CYCLES = 10
+
+
+# ------------------------------------------
+# Continuous: Cycle Prompt Builders
+# ------------------------------------------
+
+def _build_monitor_cycle_prompt(mission: str, cycle: int, context_summary: str) -> str:
+    return f"""## Monitor Cycle {cycle}
+
+**Your mission:** {mission}
+
+**Context from previous cycles:**
+{context_summary or "First cycle — no prior context."}
+
+**Instructions:**
+1. Check for new events, messages, or triggers related to your mission.
+2. If you find something that needs action, handle it now. Completely.
+3. If nothing needs attention, that is fine — say so briefly.
+4. Do NOT repeat actions from previous cycles (see context above).
+
+End your response with exactly this structure:
+
+<cycle_report>
+<action_taken>what you did OR "no_action"</action_taken>
+<summary>One sentence: what happened this cycle</summary>
+<carry_forward>Any context the next cycle needs to know</carry_forward>
+</cycle_report>"""
+
+
+def _build_grind_cycle_prompt(
+    mission: str, cycle: int,
+    items_completed: int, items_failed: int,
+    work_queue_state: list, context_summary: str,
+) -> str:
+    if work_queue_state:
+        next_items = work_queue_state[:3]
+        queue_display = "\n".join(f"  - {item}" for item in next_items)
+        remaining = len(work_queue_state)
+    else:
+        queue_display = "  (empty — you need to discover more work items based on your mission)"
+        remaining = 0
+
+    return f"""## Work Cycle {cycle}
+
+**Your mission:** {mission}
+
+**Progress:** {items_completed} completed, {items_failed} failed
+**Work queue ({remaining} items):**
+{queue_display}
+
+**Context from recent work:**
+{context_summary or "First cycle — starting fresh."}
+
+**Instructions:**
+1. If the work queue has items, pick the NEXT one (the first in the list) and execute it fully.
+   - Research it if needed, prepare the action, execute it, confirm the result.
+   - Do the actual work. Do not plan it — DO it.
+2. If the work queue is empty, discover more work items based on your mission.
+   - Search, browse, research — find the next batch of items to process.
+   - Add them to your queue.
+3. Each cycle = one work item fully completed OR a batch of new items discovered.
+4. Never re-do work from previous cycles. Check the context above.
+
+End your response with exactly this structure:
+
+<cycle_report>
+<status>completed | discovered_work | error</status>
+<work_item>What specific item you processed (or "discovery" if finding new items)</work_item>
+<action_taken>Exactly what you did</action_taken>
+<outcome>The result (email sent, reply posted, article written, items found, etc.)</outcome>
+<summary>One sentence for the activity feed</summary>
+<work_queue_update>["next item 1", "next item 2", ...]</work_queue_update>
+<items_remaining>number</items_remaining>
+<carry_forward>Context for the next cycle</carry_forward>
+</cycle_report>"""
+
+
+# ------------------------------------------
+# Continuous: Cycle Report Parser
+# ------------------------------------------
+
+def _parse_cycle_report(output: str, mode: str) -> dict:
+    """Extract structured cycle report from agent output."""
+    report = {
+        "status": "completed",
+        "work_item": None,
+        "action_taken": "no_action",
+        "outcome": None,
+        "summary": "Cycle completed",
+        "carry_forward": "",
+        "work_queue_update": None,
+        "items_remaining": None,
+        "error": None,
+    }
+
+    def _extract_tag(tag: str, text: str) -> str:
+        match = re.search(f"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    report_block = _extract_tag("cycle_report", output)
+    if not report_block:
+        report["summary"] = output[:200] if output else "No output"
+        return report
+
+    report["action_taken"] = _extract_tag("action_taken", report_block) or "no_action"
+    report["summary"] = _extract_tag("summary", report_block) or output[:200]
+    report["carry_forward"] = _extract_tag("carry_forward", report_block)
+
+    if mode == "grind":
+        report["status"] = _extract_tag("status", report_block) or "completed"
+        report["work_item"] = _extract_tag("work_item", report_block)
+        report["outcome"] = _extract_tag("outcome", report_block)
+
+        queue_raw = _extract_tag("work_queue_update", report_block)
+        if queue_raw:
+            try:
+                parsed = json.loads(queue_raw)
+                if isinstance(parsed, list):
+                    report["work_queue_update"] = [str(item) for item in parsed]
+            except (json.JSONDecodeError, TypeError):
+                lines = [l.strip().lstrip("- ") for l in queue_raw.split("\n") if l.strip()]
+                if lines:
+                    report["work_queue_update"] = lines
+
+        remaining_raw = _extract_tag("items_remaining", report_block)
+        if remaining_raw:
+            try:
+                report["items_remaining"] = int(remaining_raw.strip())
+            except ValueError:
+                pass
+
+    return report
+
+
+# ------------------------------------------
+# Continuous: Guard Rails
+# ------------------------------------------
+
+def _check_continuous_guards(
+    total_cost: float, max_cost: float,
+    items_completed: int, max_items,
+    consecutive_errors: int, max_errors: int,
+    consecutive_no_ops: int, max_no_ops: int,
+    mode: str,
+) -> tuple:
+    """Returns (should_stop, reason, final_status)"""
+
+    if total_cost >= max_cost:
+        return True, f"Cost cap reached: ${total_cost:.2f} / ${max_cost:.2f}", "stopped"
+
+    if consecutive_errors >= max_errors:
+        return True, f"Too many consecutive errors ({consecutive_errors})", "error"
+
+    if mode == "grind" and max_items and items_completed >= max_items:
+        return True, f"Work complete: {items_completed}/{max_items} items done", "completed"
+
+    if mode == "monitor" and consecutive_no_ops >= max_no_ops:
+        return True, f"Agent stalled: {consecutive_no_ops} cycles with no action", "stopped"
+
+    return False, "", ""
+
+
+# ------------------------------------------
+# Continuous: DB Helpers
+# ------------------------------------------
+
+def _update_continuous_run(run_id: str, **fields):
+    """Update a continuous_runs record."""
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        db.table("continuous_runs").update(fields).eq("id", run_id).execute()
+    except Exception as e:
+        print(f"[Continuous] DB update failed for run {run_id}: {e}")
+
+
+def _get_continuous_run_status(run_id: str) -> str:
+    """Check current run status (for pause/stop detection)."""
+    try:
+        result = db.table("continuous_runs").select("status").eq("id", run_id).execute()
+        if result.data:
+            return result.data[0]["status"]
+    except Exception as e:
+        print(f"[Continuous] Failed to check status for {run_id}: {e}")
+    return "stopped"
+
+
+def _log_continuous_cycle(run_id: str, cycle: int, report: dict,
+                          input_tokens: int, output_tokens: int,
+                          cost: float, started_at: float):
+    """Write one row to continuous_cycle_log."""
+    try:
+        completed_at = datetime.now(timezone.utc)
+        duration = time.time() - started_at
+        status = "no_op" if report.get("action_taken") == "no_action" else (
+            "error" if report.get("status") == "error" else "completed"
+        )
+        db.table("continuous_cycle_log").insert({
+            "continuous_run_id": run_id,
+            "cycle_number": cycle,
+            "status": status,
+            "work_item": (report.get("work_item") or "")[:500],
+            "action_taken": (report.get("action_taken") or "")[:500],
+            "outcome": (report.get("outcome") or "")[:500],
+            "summary": (report.get("summary") or "")[:500],
+            "error": (report.get("error") or "")[:500] if report.get("error") else None,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost,
+            "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "duration_seconds": round(duration, 2),
+        }).execute()
+    except Exception as e:
+        print(f"[Continuous] Failed to log cycle {cycle}: {e}")
+
+
+def _calculate_cycle_cost(input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost using Claude Sonnet 4.6 pricing ($3/M in, $15/M out)."""
+    return round((input_tokens / 1_000_000) * 3 + (output_tokens / 1_000_000) * 15, 4)
+
+
+def _compress_context_summary(summary: str, max_chars: int = 3000) -> str:
+    """Keep context summary under a size limit by trimming older entries."""
+    if not summary or len(summary) <= max_chars:
+        return summary or ""
+    lines = summary.split("\n")
+    while len("\n".join(lines)) > max_chars and len(lines) > 3:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+# ------------------------------------------
+# Continuous: Single Cycle Executor
+# ------------------------------------------
+
+def _execute_single_cycle(
+    api_key: str,
+    system_prompt: str,
+    cycle_prompt: str,
+    composio_mcp_url: str = None,
+    composio_api_key: str = None,
+    user_id: str = None,
+    max_iterations: int = 25,
+) -> dict:
+    """
+    Run one complete agent turn for a continuous cycle.
+    Uses the same patterns as run_tier1_durable's inner loop.
+    Returns {"output": str, "input_tokens": int, "output_tokens": int}
+    """
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    request_body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 8192,
+        "system": system_prompt,
+    }
+
+    # Add Composio MCP if available (same pattern as run_tier1_durable)
+    if composio_mcp_url:
+        headers["anthropic-beta"] = "mcp-client-2025-11-20"
+        mcp_server = {
+            "type": "url",
+            "url": composio_mcp_url,
+            "name": "composio",
+        }
+        if composio_api_key and "api_key=" not in composio_mcp_url:
+            mcp_server["authorization_token"] = composio_api_key
+        request_body["mcp_servers"] = [mcp_server]
+        request_body["tools"] = [
+            {"type": "mcp_toolset", "mcp_server_name": "composio"},
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 10},
+        ]
+    else:
+        request_body["tools"] = [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 10},
+        ]
+
+    # Inject memory context
+    if user_id:
+        try:
+            memory_context = load_memory_context(user_id, cycle_prompt[:500])
+            if memory_context:
+                request_body["system"] += f"\n\n## User Context\n{memory_context[:2000]}"
+        except Exception:
+            pass
+
+    messages = [{"role": "user", "content": cycle_prompt}]
+    accumulated_output = ""
+    total_in = 0
+    total_out = 0
+
+    for iteration in range(max_iterations):
+        request_body["messages"] = messages
+
+        resp = _call_anthropic_with_retry(headers, request_body)
+        if resp is None:
+            raise Exception("Anthropic API call failed after retries")
+
+        result = resp.json()
+        usage = result.get("usage", {})
+        total_in += usage.get("input_tokens", 0)
+        total_out += usage.get("output_tokens", 0)
+
+        content_blocks = result.get("content", [])
+        text_blocks = [b for b in content_blocks if b.get("type") == "text"]
+        iteration_text = "\n".join(b.get("text", "") for b in text_blocks)
+        if iteration_text:
+            accumulated_output += iteration_text
+
+        stop_reason = result.get("stop_reason", "end_turn")
+
+        if stop_reason == "end_turn":
+            break
+
+        # Process tool calls
+        tool_blocks = [b for b in content_blocks if b.get("type") in ("tool_use", "mcp_tool_use")]
+        if tool_blocks:
+            messages.append({"role": "assistant", "content": content_blocks})
+            tool_results = []
+            for block in tool_blocks:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.get("id", ""),
+                    "content": "Executed. Continue with the task.",
+                })
+            messages.append({"role": "user", "content": tool_results})
+            messages = _compact_tool_results(messages)
+        else:
+            break
+
+        # Auto-compact within a single cycle if context grows
+        if _estimate_tokens(messages) > AUTOCOMPACT_THRESHOLD:
+            messages = _autocompact_messages(messages, accumulated_output, api_key)
+
+    return {
+        "output": accumulated_output,
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+    }
+
+
+# ------------------------------------------
+# Continuous: Main Execution Loop
+# ------------------------------------------
+
+def run_continuous(
+    continuous_run_id: str,
+    job_id: str,
+    mode: str = "monitor",
+    mission: str = "",
+    session_id: str = None,
+    agent_id: str = None,
+    user_id: str = None,
+    composio_api_key: str = None,
+    composio_mcp_url: str = None,
+    composio_entity_id: str = None,
+    cycle_interval_seconds: int = 60,
+    max_cost_usd: float = 10.00,
+    max_items: int = None,
+    max_consecutive_errors: int = 3,
+    system_prompt_override: str = None,
+):
+    """
+    The continuous execution engine.
+    Handles both Monitor (check-act-sleep) and Grind (queue-execute-next) patterns.
+    Runs on Railway as a daemon thread. Never exits unless stopped.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    cycle = 0
+    consecutive_errors = 0
+    consecutive_no_ops = 0
+    items_completed = 0
+    items_failed = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost = 0.0
+    cycle_context_summary = ""
+    work_queue_state = []
+    last_compact_at_cycle = 0
+
+    system_prompt = system_prompt_override or (
+        CONTINUOUS_MONITOR_SYSTEM_PROMPT if mode == "monitor"
+        else CONTINUOUS_GRIND_SYSTEM_PROMPT
+    )
+
+    # Refresh Composio MCP URL if we have credentials
+    if composio_entity_id and composio_api_key:
+        try:
+            fresh_url = refresh_composio_mcp_url(composio_entity_id, composio_api_key)
+            if fresh_url:
+                composio_mcp_url = fresh_url
+        except Exception as e:
+            print(f"[Continuous] Initial Composio refresh failed: {e}")
+
+    _update_continuous_run(continuous_run_id,
+                           status="running",
+                           started_at=datetime.now(timezone.utc).isoformat())
+
+    print(f"[Continuous] Started run {continuous_run_id} mode={mode} "
+          f"interval={cycle_interval_seconds}s max_cost=${max_cost_usd}")
+
+    try:
+        while True:
+            cycle += 1
+            cycle_start = time.time()
+
+            # ── 1. CHECK CONTROLS ──
+            run_status = _get_continuous_run_status(continuous_run_id)
+
+            if run_status == "stopped":
+                print(f"[Continuous] Run {continuous_run_id} stopped by user")
+                break
+
+            if run_status == "paused":
+                _update_continuous_run(continuous_run_id,
+                    last_heartbeat_at=datetime.now(timezone.utc).isoformat())
+                time.sleep(5)
+                cycle -= 1
+                continue
+
+            if run_status not in ("running", "pending"):
+                print(f"[Continuous] Unexpected status '{run_status}', stopping")
+                break
+
+            # ── 2. CHECK GUARD RAILS ──
+            should_stop, reason, final_status = _check_continuous_guards(
+                total_cost, max_cost_usd,
+                items_completed, max_items,
+                consecutive_errors, max_consecutive_errors,
+                consecutive_no_ops, 50,
+                mode,
+            )
+            if should_stop:
+                print(f"[Continuous] Guard triggered: {reason}")
+                _update_continuous_run(continuous_run_id,
+                    status=final_status, last_error=reason,
+                    stopped_at=datetime.now(timezone.utc).isoformat())
+                break
+
+            # ── 3. REFRESH COMPOSIO (every 10th cycle) ──
+            if composio_entity_id and composio_api_key and cycle % 10 == 1:
+                try:
+                    fresh_url = refresh_composio_mcp_url(composio_entity_id, composio_api_key)
+                    if fresh_url:
+                        composio_mcp_url = fresh_url
+                except Exception as e:
+                    print(f"[Continuous] Composio refresh failed cycle {cycle}: {e}")
+
+            # ── 4. BUILD CYCLE PROMPT ──
+            if mode == "monitor":
+                cycle_prompt = _build_monitor_cycle_prompt(
+                    mission, cycle, cycle_context_summary
+                )
+            else:
+                cycle_prompt = _build_grind_cycle_prompt(
+                    mission, cycle, items_completed, items_failed,
+                    work_queue_state, cycle_context_summary
+                )
+
+            # ── 5. EXECUTE ONE CYCLE ──
+            try:
+                cycle_result = _execute_single_cycle(
+                    api_key=api_key,
+                    system_prompt=system_prompt,
+                    cycle_prompt=cycle_prompt,
+                    composio_mcp_url=composio_mcp_url,
+                    composio_api_key=composio_api_key,
+                    user_id=user_id,
+                )
+                consecutive_errors = 0
+
+            except Exception as cycle_err:
+                consecutive_errors += 1
+                print(f"[Continuous] Cycle {cycle} error ({consecutive_errors}/"
+                      f"{max_consecutive_errors}): {cycle_err}")
+
+                _log_continuous_cycle(continuous_run_id, cycle,
+                    {"status": "error", "action_taken": "error",
+                     "summary": str(cycle_err)[:200], "error": str(cycle_err)[:500]},
+                    0, 0, 0, cycle_start)
+
+                _update_continuous_run(continuous_run_id,
+                    current_cycle=cycle,
+                    consecutive_errors=consecutive_errors,
+                    last_error=str(cycle_err)[:500],
+                    last_heartbeat_at=datetime.now(timezone.utc).isoformat())
+
+                if consecutive_errors >= max_consecutive_errors:
+                    _update_continuous_run(continuous_run_id,
+                        status="error",
+                        last_error=f"Stopped after {consecutive_errors} errors: {cycle_err}",
+                        stopped_at=datetime.now(timezone.utc).isoformat())
+                    break
+
+                time.sleep(min(30, 2 ** consecutive_errors))
+                continue
+
+            # ── 6. PARSE CYCLE RESULT ──
+            report = _parse_cycle_report(cycle_result["output"], mode)
+
+            # ── 7. UPDATE COUNTERS ──
+            cycle_in = cycle_result["input_tokens"]
+            cycle_out = cycle_result["output_tokens"]
+            cycle_cost = _calculate_cycle_cost(cycle_in, cycle_out)
+            total_input_tokens += cycle_in
+            total_output_tokens += cycle_out
+            total_cost += cycle_cost
+
+            if report["action_taken"] == "no_action":
+                consecutive_no_ops += 1
+            else:
+                consecutive_no_ops = 0
+                if report.get("status") == "error":
+                    items_failed += 1
+                else:
+                    items_completed += 1
+
+            # Update work queue (grind mode)
+            if mode == "grind" and report.get("work_queue_update") is not None:
+                work_queue_state = report["work_queue_update"]
+
+            # Update context summary
+            if report["action_taken"] != "no_action":
+                new_entry = f"Cycle {cycle}: {report['summary']}"
+                cycle_context_summary = _compress_context_summary(
+                    (cycle_context_summary + "\n" + new_entry).strip() if cycle_context_summary else new_entry
+                )
+            if report.get("carry_forward"):
+                cycle_context_summary = _compress_context_summary(
+                    (cycle_context_summary + "\n[Latest] " + report["carry_forward"]).strip()
+                )
+
+            # ── 8. LOG CYCLE ──
+            _log_continuous_cycle(continuous_run_id, cycle, report,
+                                  cycle_in, cycle_out, cycle_cost, cycle_start)
+
+            # ── 9. UPDATE RUN STATE + HEARTBEAT ──
+            _update_continuous_run(continuous_run_id,
+                current_cycle=cycle,
+                items_completed=items_completed,
+                items_failed=items_failed,
+                items_remaining=report.get("items_remaining"),
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                total_cost_usd=total_cost,
+                consecutive_errors=consecutive_errors,
+                consecutive_no_ops=consecutive_no_ops,
+                last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+                last_cycle_summary=(report.get("summary") or "")[:500],
+                cycle_context_summary=cycle_context_summary[:5000],
+                work_queue_state=json.dumps(work_queue_state) if work_queue_state else "[]",
+            )
+
+            cycle_duration = round(time.time() - cycle_start, 1)
+            print(f"[Continuous] Cycle {cycle} ({mode}): "
+                  f"{report.get('action_taken', '?')} | "
+                  f"${cycle_cost} | {cycle_duration}s | "
+                  f"items={items_completed} | total=${total_cost:.2f}")
+
+            # ── 10. HARD CONTEXT RESET ──
+            if (cycle - last_compact_at_cycle) >= HARD_RESET_EVERY_N_CYCLES:
+                cycle_context_summary = _compress_context_summary(
+                    cycle_context_summary, max_chars=1500
+                )
+                last_compact_at_cycle = cycle
+                print(f"[Continuous] Hard context reset at cycle {cycle}")
+
+            # ── 11. SLEEP ──
+            if mode == "monitor":
+                time.sleep(cycle_interval_seconds)
+            else:
+                time.sleep(max(3, cycle_interval_seconds))
+
+    except Exception as e:
+        print(f"[Continuous] Fatal error in run {continuous_run_id}: {e}")
+        traceback.print_exc()
+        _update_continuous_run(continuous_run_id,
+            status="error",
+            last_error=f"Fatal: {str(e)[:500]}",
+            stopped_at=datetime.now(timezone.utc).isoformat())
+
+    print(f"[Continuous] Run {continuous_run_id} ended. "
+          f"Cycles={cycle}, items={items_completed}, cost=${total_cost:.2f}")
+
+
+# ===========================================================================
+# CONTINUOUS EXECUTION ENDPOINTS
+# ===========================================================================
+
+@app.post("/continuous/start")
+def start_continuous(body: ContinuousStartRequest):
+    """Start a new continuous execution run (monitor or grind)."""
+    continuous_run_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+
+    interval = body.cycle_interval_seconds or (60 if body.mode == "monitor" else 5)
+
+    db.table("continuous_runs").insert({
+        "id": continuous_run_id,
+        "agent_id": body.agent_id,
+        "session_id": body.session_id,
+        "user_id": body.user_id,
+        "mode": body.mode,
+        "mission": body.mission,
+        "cycle_interval_seconds": interval,
+        "max_cost_usd": body.max_cost_usd or 10.00,
+        "max_items": body.max_items,
+        "composio_api_key": body.composio_api_key,
+        "composio_mcp_url": body.composio_mcp_url,
+        "composio_entity_id": body.composio_entity_id,
+        "system_prompt_override": body.system_prompt,
+    }).execute()
+
+    create_job(job_id)
+
+    thread = threading.Thread(
+        target=run_continuous,
+        args=(continuous_run_id, job_id),
+        kwargs={
+            "mode": body.mode,
+            "mission": body.mission,
+            "session_id": body.session_id,
+            "agent_id": body.agent_id,
+            "user_id": body.user_id,
+            "composio_api_key": body.composio_api_key,
+            "composio_mcp_url": body.composio_mcp_url,
+            "composio_entity_id": body.composio_entity_id,
+            "cycle_interval_seconds": interval,
+            "max_cost_usd": float(body.max_cost_usd or 10.00),
+            "max_items": body.max_items,
+            "system_prompt_override": body.system_prompt,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    print(f"[Continuous] Started: id={continuous_run_id} mode={body.mode} agent={body.agent_id}")
+
+    return {
+        "continuous_run_id": continuous_run_id,
+        "job_id": job_id,
+        "mode": body.mode,
+        "status": "running",
+    }
+
+
+@app.post("/continuous/{run_id}/control")
+def control_continuous(run_id: str, body: ContinuousControlRequest):
+    """Pause, resume, or stop a continuous run."""
+    run = db.table("continuous_runs").select("status").eq("id", run_id).execute()
+    if not run.data:
+        raise HTTPException(404, "Continuous run not found")
+
+    current = run.data[0]["status"]
+    action = body.action
+    now = datetime.now(timezone.utc).isoformat()
+
+    if action == "pause" and current == "running":
+        _update_continuous_run(run_id, status="paused", paused_at=now)
+        return {"continuous_run_id": run_id, "status": "paused"}
+    elif action == "resume" and current == "paused":
+        _update_continuous_run(run_id, status="running", paused_at=None)
+        return {"continuous_run_id": run_id, "status": "running"}
+    elif action == "stop" and current in ("running", "paused"):
+        _update_continuous_run(run_id, status="stopped", stopped_at=now)
+        return {"continuous_run_id": run_id, "status": "stopped"}
+    else:
+        raise HTTPException(400, f"Cannot '{action}' a run with status '{current}'")
+
+
+@app.get("/continuous/{run_id}/status")
+def get_continuous_status(run_id: str):
+    """Get current state and recent cycles for a continuous run."""
+    run = db.table("continuous_runs").select("*").eq("id", run_id).execute()
+    if not run.data:
+        raise HTTPException(404, "Continuous run not found")
+
+    cycles = db.table("continuous_cycle_log") \
+        .select("cycle_number, status, work_item, action_taken, outcome, "
+                "summary, input_tokens, output_tokens, cost_usd, "
+                "started_at, completed_at, duration_seconds") \
+        .eq("continuous_run_id", run_id) \
+        .order("cycle_number", desc=True) \
+        .limit(20) \
+        .execute()
+
+    result = run.data[0]
+    result["recent_cycles"] = cycles.data or []
+    return result
+
+
+@app.get("/continuous/{run_id}/cycles")
+def get_continuous_cycles(run_id: str, offset: int = 0, limit: int = 50):
+    """Get paginated cycle history for a continuous run."""
+    cycles = db.table("continuous_cycle_log") \
+        .select("*") \
+        .eq("continuous_run_id", run_id) \
+        .order("cycle_number", desc=True) \
+        .range(offset, offset + limit - 1) \
+        .execute()
+
+    return {
+        "cycles": cycles.data or [],
+        "offset": offset,
+        "limit": limit,
+    }
