@@ -176,8 +176,10 @@ class DurableExecuteRequest(BaseModel):
 class ConvertDocumentRequest(BaseModel):
     content: str
     title: str = "Document"
-    session_id: str
     formats: list = ["docx", "pdf"]
+    signed_urls: Optional[dict] = None     # {"docx": "https://...", "pdf": "https://..."}
+    upload_tokens: Optional[dict] = None   # {"docx": "token", "pdf": "token"}
+    upload_paths: Optional[dict] = None    # {"docx": "session/file.docx", "pdf": "session/file.pdf"}
 
 
 class FileInfo(BaseModel):
@@ -1769,12 +1771,18 @@ def get_result(job_id: str):
 
 # ------------------------------------------
 # POST /convert-document — Markdown to DOCX/PDF
+# Generates files and uploads via pre-signed URLs provided by the caller.
+# This respects the system boundary: Railway never needs Lovable's Supabase credentials.
 # ------------------------------------------
 @app.post("/convert-document")
 def convert_document(body: ConvertDocumentRequest):
-    """Convert markdown content to .docx and/or .pdf, upload to Supabase storage."""
+    """Convert markdown content to .docx and/or .pdf, upload via signed URLs."""
+    import traceback
     results = {}
     safe_title = re.sub(r'[^a-zA-Z0-9._-]', '_', body.title)[:60]
+
+    print(f"[Convert] Request: title='{body.title}', "
+          f"formats={body.formats}, content_length={len(body.content)}")
 
     for fmt in body.formats:
         try:
@@ -1789,24 +1797,51 @@ def convert_document(body: ConvertDocumentRequest):
             else:
                 continue
 
-            path = f"{body.session_id}/{int(datetime.now(timezone.utc).timestamp())}_{filename}"
-            db.storage.from_("agent-files").upload(
-                path, file_bytes,
-                {"content-type": content_type, "upsert": "false"}
-            )
+            print(f"[Convert] {fmt} generated: {len(file_bytes)} bytes")
 
-            url_data = db.storage.from_("agent-files").get_public_url(path)
+            # Upload via pre-signed URL if provided
+            signed_url = (body.signed_urls or {}).get(fmt)
+            upload_token = (body.upload_tokens or {}).get(fmt)
+            uploaded_path = (body.upload_paths or {}).get(fmt)
 
-            results[fmt] = {
-                "filename": filename,
-                "url": url_data,
-                "content_type": content_type,
-                "size": len(file_bytes),
-            }
-            print(f"[Convert] {fmt}: {filename} ({len(file_bytes)} bytes) -> {url_data}")
+            if signed_url and upload_token:
+                # Upload directly to Lovable's Supabase storage via signed URL
+                upload_resp = httpx.put(
+                    signed_url,
+                    content=file_bytes,
+                    headers={
+                        "content-type": content_type,
+                        "x-upsert": "false",
+                    },
+                    timeout=60,
+                )
+                if upload_resp.is_success:
+                    print(f"[Convert] {fmt}: uploaded via signed URL ({len(file_bytes)} bytes)")
+                    results[fmt] = {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": len(file_bytes),
+                        "uploaded": True,
+                        "path": uploaded_path or "",
+                    }
+                else:
+                    print(f"[Convert] {fmt}: signed URL upload failed: {upload_resp.status_code} {upload_resp.text[:200]}")
+                    results[fmt] = {"error": f"Upload failed: {upload_resp.status_code}"}
+            else:
+                # No signed URL — return base64 as fallback
+                import base64
+                results[fmt] = {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": len(file_bytes),
+                    "uploaded": False,
+                    "data_base64": base64.b64encode(file_bytes).decode("utf-8"),
+                }
+                print(f"[Convert] {fmt}: no signed URL, returning base64 ({len(file_bytes)} bytes)")
 
         except Exception as e:
             print(f"[Convert] Error generating {fmt}: {e}")
+            traceback.print_exc()
             results[fmt] = {"error": str(e)}
 
     return {"files": results}
